@@ -1,0 +1,1458 @@
+-- StudyChat: initialize a NEW, EMPTY Supabase project only.
+-- This is schema initialization, NOT migration of old users or research data.
+-- Copy the entire file into the NEW project's SQL Editor and run ONCE.
+-- Keep the six migrations in this order. Each migration has its own transaction.
+-- If a migration fails, fix it and run only that migration and the remaining ones.
+-- After success, create an email/password administrator in Authentication > Users,
+-- then grant that user's UUID access through public.admin_users.
+
+-- ===== 001_studychat.sql =====
+-- Run once in the Supabase SQL editor. No public config or credential access.
+begin;
+
+create table public.admin_users (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+create table public.config_versions (
+  id uuid primary key default gen_random_uuid(),
+  revision bigint generated always as identity unique,
+  settings jsonb not null,
+  api_key_ciphertext text not null,
+  created_by uuid not null references auth.users(id),
+  created_at timestamptz not null default now()
+);
+create table public.study_state (
+  id int primary key check (id = 1),
+  active_config_id uuid references public.config_versions(id),
+  enabled boolean not null default false
+);
+insert into public.study_state(id) values (1);
+
+create table public.conversations (
+  id uuid primary key default gen_random_uuid(),
+  owner_id uuid not null unique references auth.users(id) on delete cascade,
+  participant_code text not null unique default ('P-' || upper(substr(replace(gen_random_uuid()::text, '-', ''), 1, 12))),
+  config_id uuid not null references public.config_versions(id),
+  title text not null default '尚未开始对话',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  lock_token uuid,
+  locked_until timestamptz,
+  request_count int not null default 0
+);
+create table public.messages (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references public.conversations(id) on delete cascade,
+  turn_id uuid not null,
+  role text not null check (role in ('user', 'assistant')),
+  content text not null check (char_length(content) <= 50000),
+  status text not null check (status in ('pending', 'complete', 'failed')),
+  error_code text,
+  sequence bigint generated always as identity,
+  created_at timestamptz not null default now(),
+  unique(conversation_id, turn_id, role)
+);
+create index messages_order on public.messages(conversation_id, sequence);
+create table public.request_events (
+  id bigint generated always as identity primary key,
+  conversation_id uuid not null references public.conversations(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+create index request_events_recent on public.request_events(conversation_id, created_at desc);
+create index conversations_recent on public.conversations(updated_at desc);
+
+alter table public.admin_users enable row level security;
+alter table public.config_versions enable row level security;
+alter table public.study_state enable row level security;
+alter table public.conversations enable row level security;
+alter table public.messages enable row level security;
+alter table public.request_events enable row level security;
+
+revoke all on public.admin_users, public.config_versions, public.study_state,
+  public.conversations, public.messages, public.request_events from anon, authenticated;
+grant select on public.conversations, public.messages to authenticated;
+grant all on public.admin_users, public.config_versions, public.study_state,
+  public.conversations, public.messages, public.request_events to service_role;
+grant usage, select on public.config_versions_revision_seq, public.messages_sequence_seq, public.request_events_id_seq to service_role;
+
+create policy own_conversations on public.conversations for select to authenticated
+  using (owner_id = (select auth.uid()));
+create policy own_messages on public.messages for select to authenticated
+  using (exists (select 1 from public.conversations c where c.id = conversation_id and c.owner_id = (select auth.uid())));
+
+create function public.publish_config(p_settings jsonb, p_ciphertext text, p_actor uuid, p_expected_revision bigint, p_enabled boolean)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare current_revision bigint; result public.config_versions;
+begin
+  perform 1 from study_state where id = 1 for update;
+  if not exists(select 1 from admin_users where user_id = p_actor) then raise exception 'FORBIDDEN'; end if;
+  select coalesce(v.revision, 0) into current_revision from study_state s
+    left join config_versions v on v.id = s.active_config_id where s.id = 1;
+  if current_revision <> p_expected_revision then raise exception 'CONFLICT'; end if;
+  insert into config_versions(settings, api_key_ciphertext, created_by)
+    values(p_settings, p_ciphertext, p_actor) returning * into result;
+  update study_state set active_config_id = result.id, enabled = p_enabled where id = 1;
+  return to_jsonb(result);
+end;
+$$;
+
+create function public.get_or_create_conversation(p_owner uuid)
+returns public.conversations language plpgsql security definer set search_path = public, pg_temp as $$
+declare result public.conversations; active_config uuid; is_enabled boolean;
+begin
+  select * into result from conversations where owner_id = p_owner;
+  if found then
+    -- Interrupted streams retain partial text, and become retryable after lease expiry.
+    if result.locked_until is not null and result.locked_until < now() then
+      update conversations set lock_token = null, locked_until = null
+        where id = result.id and locked_until < now();
+      if found then
+        update messages set status = 'failed', error_code = 'interrupted'
+          where conversation_id = result.id and status = 'pending';
+      end if;
+    end if;
+    select * into result from conversations where id = result.id;
+    return result;
+  end if;
+  select active_config_id, enabled into active_config, is_enabled from study_state where id = 1;
+  if active_config is null then raise exception 'NOT_CONFIGURED'; end if;
+  if not is_enabled then raise exception 'STUDY_PAUSED'; end if;
+  insert into conversations(owner_id, config_id) values(p_owner, active_config)
+    on conflict(owner_id) do nothing;
+  select * into result from conversations where owner_id = p_owner;
+  return result;
+end;
+$$;
+
+create function public.begin_turn(p_conversation uuid, p_owner uuid, p_turn uuid, p_content text)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare c public.conversations; u public.messages; a public.messages; lease uuid; recent_count int;
+begin
+  if char_length(trim(p_content)) < 1 or char_length(p_content) > 8000 then raise exception 'INVALID_CONTENT'; end if;
+  select * into c from conversations where id = p_conversation for update;
+  if not found or c.owner_id <> p_owner then raise exception 'FORBIDDEN'; end if;
+  select * into u from messages where conversation_id = c.id and turn_id = p_turn and role = 'user';
+  if found and u.content <> p_content then raise exception 'TURN_CONFLICT'; end if;
+  select * into a from messages where conversation_id = c.id and turn_id = p_turn and role = 'assistant';
+  if found and a.status = 'complete' then
+    return jsonb_build_object('state', 'complete', 'user', to_jsonb(u), 'assistant', to_jsonb(a));
+  end if;
+  if not (select enabled from study_state where id = 1) then raise exception 'STUDY_PAUSED'; end if;
+  if c.locked_until > now() then raise exception 'BUSY'; end if;
+  if exists(select 1 from messages where conversation_id = c.id and role = 'assistant' and status <> 'complete' and turn_id <> p_turn) then
+    raise exception 'BUSY';
+  end if;
+  select count(*) into recent_count from request_events where conversation_id = c.id and created_at > now() - interval '1 minute';
+  if recent_count >= 8 then raise exception 'RATE_LIMITED'; end if;
+  if c.request_count >= 200 then raise exception 'SESSION_LIMIT'; end if;
+  lease := gen_random_uuid();
+  update conversations set lock_token = lease, locked_until = now() + interval '150 seconds',
+    request_count = request_count + 1, updated_at = now(),
+    title = case when title = '尚未开始对话' then left(p_content, 60) else title end where id = c.id;
+  insert into request_events(conversation_id) values(c.id);
+  insert into messages(conversation_id, turn_id, role, content, status)
+    values(c.id, p_turn, 'user', p_content, 'complete') on conflict(conversation_id, turn_id, role) do nothing;
+  insert into messages(conversation_id, turn_id, role, content, status)
+    values(c.id, p_turn, 'assistant', '', 'pending')
+    on conflict(conversation_id, turn_id, role) do update set content = '', status = 'pending', error_code = null;
+  select * into u from messages where conversation_id = c.id and turn_id = p_turn and role = 'user';
+  select * into a from messages where conversation_id = c.id and turn_id = p_turn and role = 'assistant';
+  return jsonb_build_object('state', 'acquired', 'lock_token', lease, 'user', to_jsonb(u), 'assistant', to_jsonb(a));
+end;
+$$;
+
+create function public.save_reply(p_conversation uuid, p_turn uuid, p_lease uuid, p_content text, p_status text, p_error text default null)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare result public.messages;
+begin
+  if p_status not in ('pending', 'complete', 'failed') then raise exception 'INVALID_STATUS'; end if;
+  perform 1 from conversations where id = p_conversation and lock_token = p_lease for update;
+  if not found then raise exception 'STALE_LEASE'; end if;
+  update messages set content = p_content, status = p_status, error_code = p_error
+    where conversation_id = p_conversation and turn_id = p_turn and role = 'assistant' returning * into result;
+  if not found then raise exception 'MISSING_REPLY'; end if;
+  if p_status <> 'pending' then
+    update conversations set lock_token = null, locked_until = null, updated_at = now() where id = p_conversation;
+  end if;
+  return to_jsonb(result);
+end;
+$$;
+
+revoke all on function public.publish_config(jsonb,text,uuid,bigint,boolean) from public, anon, authenticated;
+revoke all on function public.get_or_create_conversation(uuid) from public, anon, authenticated;
+revoke all on function public.begin_turn(uuid,uuid,uuid,text) from public, anon, authenticated;
+revoke all on function public.save_reply(uuid,uuid,uuid,text,text,text) from public, anon, authenticated;
+grant execute on function public.publish_config(jsonb,text,uuid,bigint,boolean) to service_role;
+grant execute on function public.get_or_create_conversation(uuid) to service_role;
+grant execute on function public.begin_turn(uuid,uuid,uuid,text) to service_role;
+grant execute on function public.save_reply(uuid,uuid,uuid,text,text,text) to service_role;
+commit;
+
+-- ===== 002_factorial_experiment.sql =====
+-- Upgrade after 001_studychat.sql. Preserves all historical conversations.
+-- Run the entire file once in Supabase SQL Editor before deploying the new app.
+begin;
+create table public.experiment_versions (
+  id uuid primary key default gen_random_uuid(),
+  revision bigint generated always as identity unique,
+  settings jsonb not null,
+  encrypted_keys jsonb not null,
+  created_by uuid not null references auth.users(id),
+  created_at timestamptz not null default now()
+);
+alter table public.study_state add column active_experiment_id uuid references public.experiment_versions(id);
+create table public.experiment_groups (
+  experiment_id uuid not null references public.experiment_versions(id),
+  group_code text not null check (group_code in ('deepseek_personality','deepseek_control','chatgpt_personality','chatgpt_control')),
+  model_factor text not null check (model_factor in ('deepseek','chatgpt')),
+  personality boolean not null,
+  config_id uuid not null unique references public.config_versions(id),
+  primary key (experiment_id, group_code),
+  check (group_code = model_factor || case when personality then '_personality' else '_control' end)
+);
+create table public.participant_enrollments (
+  student_id text primary key check (student_id ~ '^[0-9A-Z_-]{1,32}$'),
+  owner_id uuid not null unique references auth.users(id),
+  conversation_id uuid not null unique references public.conversations(id),
+  experiment_id uuid not null,
+  group_code text not null,
+  assigned_at timestamptz not null default now(),
+  foreign key (experiment_id, group_code) references public.experiment_groups(experiment_id, group_code)
+);
+create index participant_enrollments_group on public.participant_enrollments(group_code);
+alter table public.experiment_versions enable row level security;
+alter table public.experiment_groups enable row level security;
+alter table public.participant_enrollments enable row level security;
+revoke all on public.experiment_versions, public.experiment_groups, public.participant_enrollments from public, anon, authenticated;
+grant all on public.experiment_versions, public.experiment_groups, public.participant_enrollments to service_role;
+grant usage, select on public.experiment_versions_revision_seq to service_role;
+
+-- Direct authenticated REST queries cannot expose config identifiers or leases.
+revoke select on public.conversations from authenticated;
+grant select(id,owner_id,participant_code,title,created_at,updated_at,request_count,locked_until)
+  on public.conversations to authenticated;
+-- Retire the old creation/publishing entry points; existing data remains untouched.
+revoke execute on function public.publish_config(jsonb,text,uuid,bigint,boolean) from service_role;
+revoke execute on function public.get_or_create_conversation(uuid) from service_role;
+
+create function public.publish_experiment(p_settings jsonb, p_keys jsonb, p_actor uuid, p_expected_revision bigint, p_enabled boolean)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare v public.experiment_versions; current_revision bigint; factor text; has_personality boolean;
+  effective jsonb; cfg uuid; base_text text; personality_text text;
+begin
+  perform 1 from study_state where id=1 for update;
+  if not exists(select 1 from admin_users where user_id=p_actor) then raise exception 'FORBIDDEN'; end if;
+  select coalesce(e.revision,0) into current_revision from study_state s
+    left join experiment_versions e on e.id=s.active_experiment_id where s.id=1;
+  if p_expected_revision is null or current_revision <> p_expected_revision then raise exception 'CONFLICT'; end if;
+  base_text := trim(p_settings->>'base_prompt');
+  personality_text := trim(p_settings->>'personality_prompt');
+  if coalesce(char_length(base_text),0) not between 1 and 10000 or
+     coalesce(char_length(personality_text),0) not between 1 and 10000 then raise exception 'INVALID_EXPERIMENT'; end if;
+  foreach factor in array array['deepseek','chatgpt'] loop
+    if coalesce(length(trim(p_keys->>factor)),0)=0 or
+       coalesce(length(trim(p_settings->'connections'->factor->>'model')),0)=0 or
+       coalesce(p_settings->'connections'->factor->>'protocol','') not in ('openai-chat','openai-responses','anthropic')
+    then raise exception 'INVALID_EXPERIMENT'; end if;
+  end loop;
+  insert into experiment_versions(settings,encrypted_keys,created_by)
+    values(p_settings,p_keys,p_actor) returning * into v;
+  foreach factor in array array['deepseek','chatgpt'] loop
+    foreach has_personality in array array[true,false] loop
+      effective := jsonb_build_object('title',p_settings->'title','assistant_name',p_settings->'assistant_name',
+        'welcome_message',p_settings->'welcome_message','disclosure',p_settings->'disclosure') ||
+        (p_settings->'connections'->factor) ||
+        jsonb_build_object('system_prompt',base_text || case when has_personality then E'\n\n' || personality_text else '' end);
+      insert into config_versions(settings,api_key_ciphertext,created_by)
+        values(effective,p_keys->>factor,p_actor) returning id into cfg;
+      insert into experiment_groups(experiment_id,group_code,model_factor,personality,config_id)
+        values(v.id,factor || case when has_personality then '_personality' else '_control' end,factor,has_personality,cfg);
+    end loop;
+  end loop;
+  update study_state set active_experiment_id=v.id, active_config_id=null, enabled=p_enabled where id=1;
+  return to_jsonb(v);
+end;
+$$;
+create function public.restore_conversation(p_owner uuid)
+returns public.conversations language plpgsql security definer set search_path = public, pg_temp as $$
+declare result public.conversations;
+begin
+  select * into result from conversations where owner_id=p_owner for update;
+  if not found then return null; end if;
+  if result.locked_until is not null and result.locked_until < now() then
+    update conversations set lock_token=null, locked_until=null where id=result.id returning * into result;
+    update messages set status='failed', error_code='interrupted' where conversation_id=result.id and status='pending';
+  end if;
+  return result;
+end;
+$$;
+create function public.register_participant(p_owner uuid, p_student_id text)
+returns public.conversations language plpgsql security definer set search_path = public, pg_temp as $$
+declare sid text := upper(trim(p_student_id)); state public.study_state; enrollment public.participant_enrollments;
+  selected_group text; selected_config uuid; result public.conversations;
+begin
+  if sid is null or sid !~ '^[0-9A-Z_-]{1,32}$' then raise exception 'INVALID_STUDENT_ID'; end if;
+  -- Serializes enrollment with publication and other enrollments until commit.
+  select * into state from study_state where id=1 for update;
+  select * into enrollment from participant_enrollments where owner_id=p_owner;
+  if found then
+    if enrollment.student_id <> sid then raise exception 'IDENTITY_BOUND'; end if;
+    return restore_conversation(p_owner);
+  end if;
+  if exists(select 1 from participant_enrollments where student_id=sid) then raise exception 'STUDENT_UNAVAILABLE'; end if;
+  if exists(select 1 from conversations where owner_id=p_owner) then raise exception 'LEGACY_SESSION'; end if;
+  if state.active_experiment_id is null then raise exception 'NOT_CONFIGURED'; end if;
+  if not state.enabled then raise exception 'STUDY_PAUSED'; end if;
+  if (select count(*) from experiment_groups where experiment_id=state.active_experiment_id) <> 4 then raise exception 'NOT_CONFIGURED'; end if;
+  -- Min-count random allocation across all revisions, based on registrations.
+  select g.group_code,g.config_id into selected_group,selected_config
+    from experiment_groups g left join participant_enrollments e on e.group_code=g.group_code
+    where g.experiment_id=state.active_experiment_id
+    group by g.group_code,g.config_id order by count(e.student_id),random() limit 1;
+  insert into conversations(owner_id,config_id) values(p_owner,selected_config) returning * into result;
+  insert into participant_enrollments(student_id,owner_id,conversation_id,experiment_id,group_code)
+    values(sid,p_owner,result.id,state.active_experiment_id,selected_group);
+  return result;
+end;
+$$;
+create view public.admin_conversation_records as
+  select c.id,c.participant_code,c.title,c.created_at,c.updated_at,c.config_id,c.request_count,
+    e.student_id,e.group_code,e.experiment_id,e.assigned_at,g.model_factor,g.personality,v.revision as experiment_revision
+  from public.conversations c left join public.participant_enrollments e on e.conversation_id=c.id
+  left join public.experiment_groups g on g.experiment_id=e.experiment_id and g.group_code=e.group_code
+  left join public.experiment_versions v on v.id=e.experiment_id;
+revoke all on public.admin_conversation_records from public, anon, authenticated;
+grant select on public.admin_conversation_records to service_role;
+create function public.experiment_group_counts()
+returns table(group_code text, enrolled bigint) language sql stable set search_path = public, pg_temp as $$
+  select group_code,count(*) from participant_enrollments group by group_code;
+$$;
+revoke all on function public.publish_experiment(jsonb,jsonb,uuid,bigint,boolean) from public, anon, authenticated;
+revoke all on function public.restore_conversation(uuid) from public, anon, authenticated;
+revoke all on function public.register_participant(uuid,text) from public, anon, authenticated;
+revoke all on function public.experiment_group_counts() from public, anon, authenticated;
+grant execute on function public.publish_experiment(jsonb,jsonb,uuid,bigint,boolean) to service_role;
+grant execute on function public.restore_conversation(uuid) to service_role;
+grant execute on function public.register_participant(uuid,text) to service_role;
+grant execute on function public.experiment_group_counts() to service_role;
+commit;
+
+-- ===== 003_admin_delete_conversation.sql =====
+-- Upgrade after 002_factorial_experiment.sql; safe to rerun.
+-- This installs the deletion function only. It does NOT delete existing data.
+begin;
+
+create or replace function public.admin_delete_conversation(p_conversation uuid, p_actor uuid)
+returns uuid language plpgsql security definer set search_path = '' as $$
+declare target public.conversations;
+begin
+  if not exists(select 1 from public.admin_users where user_id=p_actor) then
+    raise exception 'FORBIDDEN';
+  end if;
+  -- Use the same lock order as enrollment/publication, so releasing a student
+  -- identifier and updating allocation counts happens as one transaction.
+  perform 1 from public.study_state where id=1 for update;
+  if not found then raise exception 'NOT_CONFIGURED'; end if;
+  select * into target from public.conversations where id=p_conversation for update;
+  if not found then raise exception 'CONVERSATION_NOT_FOUND'; end if;
+  if target.locked_until > clock_timestamp() then raise exception 'CONVERSATION_BUSY'; end if;
+
+  delete from public.participant_enrollments where conversation_id=target.id;
+  -- The existing foreign keys cascade messages and request_events, not Auth
+  -- accounts, other participants, or immutable model/experiment configurations.
+  delete from public.conversations where id=target.id;
+  return target.id;
+end;
+$$;
+
+revoke all on function public.admin_delete_conversation(uuid,uuid) from public, anon, authenticated;
+grant execute on function public.admin_delete_conversation(uuid,uuid) to service_role;
+notify pgrst, 'reload schema';
+commit;
+
+-- ===== 004_question_mode.sql =====
+-- Upgrade after 003. Preserves existing prompts, configurations and participant data.
+-- Apply the entire file before enabling question mode. Safe to run again.
+begin;
+alter table public.conversations add column if not exists question_progress jsonb;
+create table if not exists public.question_turns (
+  conversation_id uuid not null references public.conversations(id) on delete cascade,
+  turn_id uuid not null,
+  before_state jsonb not null,
+  after_state jsonb not null,
+  assessment jsonb,
+  created_at timestamptz not null default now(),
+  primary key(conversation_id, turn_id)
+);
+alter table public.question_turns enable row level security;
+revoke all on public.question_turns from public, anon, authenticated;
+grant all on public.question_turns to service_role;
+-- question_progress deliberately has no authenticated column grant.
+
+create or replace function public.question_mode_available()
+returns boolean language sql stable set search_path = public, pg_temp as $$ select true $$;
+
+create or replace function public.publish_experiment(p_settings jsonb, p_keys jsonb, p_actor uuid, p_expected_revision bigint, p_enabled boolean)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare v public.experiment_versions; current_revision bigint; factor text; has_personality boolean;
+  effective jsonb; cfg uuid; base_text text; personality_text text; qm jsonb; q jsonb;
+begin
+  perform 1 from study_state where id=1 for update;
+  if not exists(select 1 from admin_users where user_id=p_actor) then raise exception 'FORBIDDEN'; end if;
+  select coalesce(e.revision,0) into current_revision from study_state s
+    left join experiment_versions e on e.id=s.active_experiment_id where s.id=1;
+  if p_expected_revision is null or current_revision <> p_expected_revision then raise exception 'CONFLICT'; end if;
+  base_text := trim(p_settings->>'base_prompt');
+  personality_text := trim(p_settings->>'personality_prompt');
+  if coalesce(char_length(base_text),0) not between 1 and 10000 or
+     coalesce(char_length(personality_text),0) not between 1 and 10000 then raise exception 'INVALID_EXPERIMENT'; end if;
+  if p_settings ? 'question_mode' then
+    qm := p_settings->'question_mode';
+    if jsonb_typeof(qm) is distinct from 'object' or jsonb_typeof(qm->'enabled') is distinct from 'boolean' or
+       jsonb_typeof(qm->'questions') is distinct from 'array' then raise exception 'INVALID_QUESTION_MODE'; end if;
+    if jsonb_array_length(qm->'questions') <> 3 then raise exception 'INVALID_QUESTION_MODE'; end if;
+    for q in select value from jsonb_array_elements(qm->'questions') loop
+      if jsonb_typeof(q->'title') is distinct from 'string' or coalesce(length(trim(q->>'title')),0) not between 1 and 120 or
+         jsonb_typeof(q->'prompt') is distinct from 'string' or coalesce(length(trim(q->>'prompt')),0) not between 1 and 4000 or
+         jsonb_typeof(q->'reference') is distinct from 'string' or coalesce(length(trim(q->>'reference')),0) not between 1 and 6000 or
+         coalesce(q->>'target_level','') not in ('remember','understand','apply','analyze','evaluate','create')
+      then raise exception 'INVALID_QUESTION_MODE'; end if;
+    end loop;
+  end if;
+  foreach factor in array array['deepseek','chatgpt'] loop
+    if coalesce(length(trim(p_keys->>factor)),0)=0 or
+       coalesce(length(trim(p_settings->'connections'->factor->>'model')),0)=0 or
+       coalesce(p_settings->'connections'->factor->>'protocol','') not in ('openai-chat','openai-responses','anthropic')
+    then raise exception 'INVALID_EXPERIMENT'; end if;
+  end loop;
+  insert into experiment_versions(settings,encrypted_keys,created_by)
+    values(p_settings,p_keys,p_actor) returning * into v;
+  foreach factor in array array['deepseek','chatgpt'] loop
+    foreach has_personality in array array[true,false] loop
+      effective := jsonb_build_object('title',p_settings->'title','assistant_name',p_settings->'assistant_name',
+        'welcome_message',p_settings->'welcome_message','disclosure',p_settings->'disclosure') ||
+        (p_settings->'connections'->factor) ||
+        jsonb_build_object('system_prompt',base_text || case when has_personality then E'\n\n' || personality_text else '' end);
+      if qm is not null then effective := effective || jsonb_build_object('question_mode',qm); end if;
+      insert into config_versions(settings,api_key_ciphertext,created_by)
+        values(effective,p_keys->>factor,p_actor) returning id into cfg;
+      insert into experiment_groups(experiment_id,group_code,model_factor,personality,config_id)
+        values(v.id,factor || case when has_personality then '_personality' else '_control' end,factor,has_personality,cfg);
+    end loop;
+  end loop;
+  update study_state set active_experiment_id=v.id, active_config_id=null, enabled=p_enabled where id=1;
+  return to_jsonb(v);
+end;
+$$;
+
+create or replace function public.ensure_question_session(p_conversation uuid, p_owner uuid)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare c public.conversations; qm jsonb; q jsonb; progress jsonb; opening text;
+begin
+  select * into c from conversations where id=p_conversation for update;
+  if not found or c.owner_id <> p_owner then raise exception 'FORBIDDEN'; end if;
+  select settings->'question_mode' into qm from config_versions where id=c.config_id;
+  if qm->>'enabled' is distinct from 'true' then return null; end if;
+  if c.question_progress is not null then return c.question_progress; end if;
+  if not (select enabled from study_state where id=1) then raise exception 'STUDY_PAUSED'; end if;
+  if exists(select 1 from messages where conversation_id=c.id) then raise exception 'QUESTION_ALREADY_STARTED'; end if;
+  q := qm->'questions'->0;
+  if q->>'prompt' is null then raise exception 'INVALID_QUESTION_MODE'; end if;
+  progress := jsonb_build_object('phase','guided','question_index',0,'guidance_turns',0,'version',0);
+  opening := E'第一轮 · 引导学习\n\n### 第 1 题 / 3：' || (q->>'title') || E'\n\n' ||
+    (q->>'prompt') || E'\n\n请先说说你的想法，我们会从你的回答开始。';
+  insert into messages(conversation_id,turn_id,role,content,status)
+    values(c.id,gen_random_uuid(),'assistant',opening,'complete');
+  update conversations set question_progress=progress,title='题目问答 · ' || left(q->>'title',50),updated_at=now() where id=c.id;
+  return progress;
+end;
+$$;
+
+create or replace function public.begin_turn(p_conversation uuid, p_owner uuid, p_turn uuid, p_content text)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare c public.conversations; u public.messages; a public.messages; lease uuid; recent_count int; qm jsonb;
+begin
+  if char_length(trim(p_content)) < 1 or char_length(p_content) > 8000 then raise exception 'INVALID_CONTENT'; end if;
+  select * into c from conversations where id=p_conversation for update;
+  if not found or c.owner_id <> p_owner then raise exception 'FORBIDDEN'; end if;
+  select * into u from messages where conversation_id=c.id and turn_id=p_turn and role='user';
+  if found and u.content <> p_content then raise exception 'TURN_CONFLICT'; end if;
+  select * into a from messages where conversation_id=c.id and turn_id=p_turn and role='assistant';
+  if found and a.status='complete' then
+    if u.id is null then raise exception 'TURN_CONFLICT'; end if;
+    return jsonb_build_object('state','complete','user',to_jsonb(u),'assistant',to_jsonb(a),'question_progress',c.question_progress);
+  end if;
+  if c.question_progress->>'phase'='completed' then raise exception 'QUESTION_COMPLETED'; end if;
+  select settings->'question_mode' into qm from config_versions where id=c.config_id;
+  if qm->>'enabled'='true' and c.question_progress is null then raise exception 'QUESTION_NOT_STARTED'; end if;
+  if not (select enabled from study_state where id=1) then raise exception 'STUDY_PAUSED'; end if;
+  if c.locked_until > now() then raise exception 'BUSY'; end if;
+  if exists(select 1 from messages where conversation_id=c.id and role='assistant' and status <> 'complete' and turn_id <> p_turn)
+    then raise exception 'BUSY'; end if;
+  select count(*) into recent_count from request_events where conversation_id=c.id and created_at > now()-interval '1 minute';
+  if recent_count >= 8 then raise exception 'RATE_LIMITED'; end if;
+  if c.request_count >= 200 then raise exception 'SESSION_LIMIT'; end if;
+  lease := gen_random_uuid();
+  update conversations set lock_token=lease,locked_until=now()+interval '150 seconds',
+    request_count=request_count+1,updated_at=now(),
+    title=case when title='尚未开始对话' then left(p_content,60) else title end where id=c.id;
+  insert into request_events(conversation_id) values(c.id);
+  insert into messages(conversation_id,turn_id,role,content,status)
+    values(c.id,p_turn,'user',p_content,'complete') on conflict(conversation_id,turn_id,role) do nothing;
+  insert into messages(conversation_id,turn_id,role,content,status)
+    values(c.id,p_turn,'assistant','','pending')
+    on conflict(conversation_id,turn_id,role) do update set content='',status='pending',error_code=null;
+  select * into u from messages where conversation_id=c.id and turn_id=p_turn and role='user';
+  select * into a from messages where conversation_id=c.id and turn_id=p_turn and role='assistant';
+  return jsonb_build_object('state','acquired','lock_token',lease,'user',to_jsonb(u),'assistant',to_jsonb(a),'question_progress',c.question_progress);
+end;
+$$;
+
+create or replace function public.begin_question_turn(p_conversation uuid, p_owner uuid, p_turn uuid, p_content text, p_version int)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare c public.conversations;
+begin
+  select * into c from conversations where id=p_conversation for update;
+  if not found or c.owner_id <> p_owner then raise exception 'FORBIDDEN'; end if;
+  if c.question_progress is null then raise exception 'QUESTION_NOT_STARTED'; end if;
+  -- Recover a committed retry even after the question/round has advanced.
+  if not exists(select 1 from messages where conversation_id=c.id and turn_id=p_turn and role='assistant' and status='complete') then
+    if p_version is null or p_version <> (c.question_progress->>'version')::int then raise exception 'QUESTION_STATE_CONFLICT'; end if;
+  end if;
+  return begin_turn(p_conversation,p_owner,p_turn,p_content);
+end;
+$$;
+revoke all on function public.begin_question_turn(uuid,uuid,uuid,text,int) from public, anon, authenticated;
+grant execute on function public.begin_question_turn(uuid,uuid,uuid,text,int) to service_role;
+
+create or replace function public.save_question_reply(p_conversation uuid, p_turn uuid, p_lease uuid,
+  p_expected jsonb, p_assessment jsonb, p_content text)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare c public.conversations; before_state jsonb; after_state jsonb; result jsonb; qm jsonb;
+  phase text; idx int; turns int; achieved boolean; student_answer text; levels text[] := array['remember','understand','apply','analyze','evaluate','create'];
+begin
+  select * into c from conversations where id=p_conversation and lock_token=p_lease for update;
+  if not found then raise exception 'STALE_LEASE'; end if;
+  before_state := c.question_progress;
+  if before_state is null or before_state is distinct from p_expected then raise exception 'QUESTION_STATE_CONFLICT'; end if;
+  phase := before_state->>'phase'; idx := (before_state->>'question_index')::int;
+  turns := (before_state->>'guidance_turns')::int;
+  if phase not in ('guided','retest') then raise exception 'QUESTION_COMPLETED'; end if;
+  if phase='guided' then
+    select settings->'question_mode' into qm from config_versions where id=c.config_id;
+    if jsonb_typeof(p_assessment->'achieved') is distinct from 'boolean' or
+       coalesce(p_assessment->>'observed_level','') not in ('unassessed','remember','understand','apply','analyze','evaluate','create') or
+       coalesce(length(trim(p_assessment->>'reply')),0) not between 1 and 3000
+    then raise exception 'INVALID_QUESTION_ASSESSMENT'; end if;
+    achieved := (p_assessment->>'achieved')::boolean;
+    if achieved then
+      select content into student_answer from messages where conversation_id=c.id and turn_id=p_turn and role='user';
+      if array_position(levels,p_assessment->>'observed_level') is null or
+         array_position(levels,p_assessment->>'observed_level') < array_position(levels,qm->'questions'->idx->>'target_level') or
+         coalesce(length(trim(p_assessment->>'evidence')),0) not between 1 and 300 or
+         coalesce(strpos(student_answer,p_assessment->>'evidence'),0)=0
+      then raise exception 'INVALID_QUESTION_ASSESSMENT'; end if;
+    end if;
+  else
+    -- Retest never invokes a judge or stores an assessment.
+    if p_assessment is not null then raise exception 'INVALID_QUESTION_ASSESSMENT'; end if;
+    achieved := true;
+  end if;
+  after_state := before_state || jsonb_build_object('version',(before_state->>'version')::int+1);
+  if phase='guided' and not achieved then
+    after_state := after_state || jsonb_build_object('guidance_turns',turns+1);
+  elsif idx < 2 then
+    after_state := after_state || jsonb_build_object('question_index',idx+1,'guidance_turns',0);
+  elsif phase='guided' then
+    after_state := after_state || jsonb_build_object('phase','retest','question_index',0,'guidance_turns',0);
+  else
+    after_state := after_state || jsonb_build_object('phase','completed','guidance_turns',0);
+  end if;
+  if coalesce(length(trim(p_content)),0)=0 then raise exception 'INVALID_CONTENT'; end if;
+  -- Message, assessment and progress commit together; a failed save advances nothing.
+  result := save_reply(c.id,p_turn,p_lease,p_content,'complete',null);
+  update conversations set question_progress=after_state where id=c.id;
+  insert into question_turns(conversation_id,turn_id,before_state,after_state,assessment)
+    values(c.id,p_turn,before_state,after_state,p_assessment);
+  return jsonb_build_object('message',result,'question_progress',after_state);
+end;
+$$;
+
+create or replace view public.admin_conversation_records as
+  select c.id,c.participant_code,c.title,c.created_at,c.updated_at,c.config_id,c.request_count,
+    e.student_id,e.group_code,e.experiment_id,e.assigned_at,g.model_factor,g.personality,v.revision as experiment_revision,
+    c.question_progress
+  from public.conversations c left join public.participant_enrollments e on e.conversation_id=c.id
+  left join public.experiment_groups g on g.experiment_id=e.experiment_id and g.group_code=e.group_code
+  left join public.experiment_versions v on v.id=e.experiment_id;
+revoke all on function public.question_mode_available() from public, anon, authenticated;
+revoke all on function public.ensure_question_session(uuid,uuid) from public, anon, authenticated;
+revoke all on function public.save_question_reply(uuid,uuid,uuid,jsonb,jsonb,text) from public, anon, authenticated;
+revoke all on function public.publish_experiment(jsonb,jsonb,uuid,bigint,boolean) from public, anon, authenticated;
+revoke all on function public.begin_turn(uuid,uuid,uuid,text) from public, anon, authenticated;
+grant execute on function public.question_mode_available() to service_role;
+grant execute on function public.ensure_question_session(uuid,uuid) to service_role;
+grant execute on function public.save_question_reply(uuid,uuid,uuid,jsonb,jsonb,text) to service_role;
+grant execute on function public.publish_experiment(jsonb,jsonb,uuid,bigint,boolean) to service_role;
+grant execute on function public.begin_turn(uuid,uuid,uuid,text) to service_role;
+notify pgrst, 'reload schema';
+commit;
+
+-- ===== 005_english_assistant.sql =====
+-- Upgrade after 004. English tutoring uses its own session, history and progress.
+-- Run the entire file once before opening the English assistant. Safe to run again.
+begin;
+
+create table if not exists public.english_assistant_configs (
+  id uuid primary key default gen_random_uuid(),
+  settings jsonb not null,
+  api_key_ciphertext text not null,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+create table if not exists public.english_assistant_state (
+  id int primary key check (id=1),
+  active_config_id uuid references public.english_assistant_configs(id),
+  enabled boolean not null default true
+);
+insert into public.english_assistant_state(id) values(1) on conflict(id) do nothing;
+create table if not exists public.english_assistant_sessions (
+  id uuid primary key default gen_random_uuid(),
+  owner_id uuid not null unique references auth.users(id) on delete cascade,
+  student_id text not null unique check (student_id ~ '^[0-9A-Z_-]{1,32}$'),
+  config_id uuid not null references public.english_assistant_configs(id),
+  participant_code text not null unique default ('EA-' || upper(substr(replace(gen_random_uuid()::text, '-', ''), 1, 12))),
+  title text not null default '英语助教 · PEEC写作',
+  request_count int not null default 0,
+  lock_token uuid,
+  locked_until timestamptz,
+  english_progress jsonb not null default '{"stage":"bridge","step":0,"version":0,"completed":false}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create table if not exists public.english_assistant_messages (
+  id uuid primary key default gen_random_uuid(),
+  session_id uuid not null references public.english_assistant_sessions(id) on delete cascade,
+  turn_id uuid not null,
+  role text not null check (role in ('user', 'assistant')),
+  content text not null check (char_length(content) <= 50000),
+  status text not null check (status in ('pending', 'complete', 'failed')),
+  error_code text,
+  sequence bigint generated always as identity,
+  created_at timestamptz not null default now(),
+  unique(session_id, turn_id, role)
+);
+create table if not exists public.english_assistant_request_events (
+  id bigint generated always as identity primary key,
+  session_id uuid not null references public.english_assistant_sessions(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+create table if not exists public.english_assistant_turns (
+  session_id uuid not null references public.english_assistant_sessions(id) on delete cascade,
+  turn_id uuid not null,
+  before_state jsonb not null,
+  after_state jsonb not null,
+  assessment jsonb not null,
+  created_at timestamptz not null default now(),
+  primary key(session_id, turn_id)
+);
+create index if not exists english_assistant_messages_order on public.english_assistant_messages(session_id, sequence);
+create index if not exists english_assistant_requests_recent on public.english_assistant_request_events(session_id, created_at desc);
+
+alter table public.english_assistant_sessions enable row level security;
+alter table public.english_assistant_configs enable row level security;
+alter table public.english_assistant_state enable row level security;
+alter table public.english_assistant_messages enable row level security;
+alter table public.english_assistant_request_events enable row level security;
+alter table public.english_assistant_turns enable row level security;
+revoke all on public.english_assistant_sessions, public.english_assistant_messages,
+  public.english_assistant_request_events, public.english_assistant_turns,
+  public.english_assistant_configs, public.english_assistant_state from public, anon, authenticated;
+-- Progress and the configuration stay behind the server API. Students can
+-- read their messages but have no table mutation or progress mutation grants.
+grant select(id, owner_id, student_id, participant_code, title, request_count, locked_until, created_at, updated_at)
+  on public.english_assistant_sessions to authenticated;
+grant select on public.english_assistant_messages to authenticated;
+grant all on public.english_assistant_sessions, public.english_assistant_messages,
+  public.english_assistant_request_events, public.english_assistant_turns,
+  public.english_assistant_configs, public.english_assistant_state to service_role;
+grant usage, select on public.english_assistant_messages_sequence_seq,
+  public.english_assistant_request_events_id_seq to service_role;
+drop policy if exists own_english_assistant_sessions on public.english_assistant_sessions;
+create policy own_english_assistant_sessions on public.english_assistant_sessions for select to authenticated
+  using (owner_id = (select auth.uid()));
+drop policy if exists own_english_assistant_messages on public.english_assistant_messages;
+create policy own_english_assistant_messages on public.english_assistant_messages for select to authenticated
+  using (exists (select 1 from public.english_assistant_sessions s where s.id = session_id and s.owner_id = (select auth.uid())));
+
+create or replace function public.seed_english_config(p_settings jsonb,p_ciphertext text)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare state public.english_assistant_state; config public.english_assistant_configs;
+begin
+  select * into state from english_assistant_state where id=1 for update;
+  if state.active_config_id is not null then
+    select * into config from english_assistant_configs where id=state.active_config_id;
+    return to_jsonb(config);
+  end if;
+  if jsonb_typeof(p_settings) is distinct from 'object' or coalesce(char_length(trim(p_settings->>'model')),0)=0 or
+    coalesce(p_settings->>'protocol','') not in ('openai-chat','openai-responses','anthropic') or
+    coalesce(char_length(trim(p_ciphertext)),0)=0 then raise exception 'INVALID_ENGLISH_CONFIG'; end if;
+  insert into english_assistant_configs(settings,api_key_ciphertext) values(p_settings,p_ciphertext) returning * into config;
+  update english_assistant_state set active_config_id=config.id where id=1;
+  return to_jsonb(config);
+end;
+$$;
+
+create or replace function public.publish_english_config(p_settings jsonb,p_ciphertext text,p_actor uuid,
+  p_enabled boolean,p_expected_id uuid default null)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare state public.english_assistant_state; config public.english_assistant_configs;
+begin
+  if not exists(select 1 from admin_users where user_id=p_actor) then raise exception 'FORBIDDEN'; end if;
+  select * into state from english_assistant_state where id=1 for update;
+  if state.active_config_id is distinct from p_expected_id then raise exception 'CONFLICT'; end if;
+  if jsonb_typeof(p_settings) is distinct from 'object' or coalesce(char_length(trim(p_settings->>'model')),0)=0 or
+    coalesce(p_settings->>'protocol','') not in ('openai-chat','openai-responses','anthropic') or
+    coalesce(char_length(trim(p_ciphertext)),0)=0 or p_enabled is null then raise exception 'INVALID_ENGLISH_CONFIG'; end if;
+  insert into english_assistant_configs(settings,api_key_ciphertext,created_by) values(p_settings,p_ciphertext,p_actor) returning * into config;
+  update english_assistant_state set active_config_id=config.id,enabled=p_enabled where id=1;
+  return to_jsonb(config);
+end;
+$$;
+
+create or replace function public.restore_english_session(p_owner uuid)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare s public.english_assistant_sessions;
+begin
+  select * into s from english_assistant_sessions where owner_id=p_owner for update;
+  if not found then return null; end if;
+  if s.locked_until is not null and s.locked_until <= now() then
+    update english_assistant_messages set status='failed',error_code='interrupted'
+      where session_id=s.id and status='pending';
+    update english_assistant_sessions set lock_token=null,locked_until=null where id=s.id returning * into s;
+  end if;
+  return to_jsonb(s);
+end;
+$$;
+
+create or replace function public.register_english_session(p_owner uuid,p_student_id text,p_initial_content text)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare sid text := upper(trim(p_student_id)); state public.english_assistant_state; s public.english_assistant_sessions;
+begin
+  if sid is null or sid !~ '^[0-9A-Z_-]{1,32}$' then raise exception 'INVALID_STUDENT_ID'; end if;
+  select * into state from english_assistant_state where id=1 for update;
+  select * into s from english_assistant_sessions where owner_id=p_owner for update;
+  if found then
+    if s.student_id<>sid then raise exception 'IDENTITY_BOUND'; end if;
+    return restore_english_session(p_owner);
+  end if;
+  if exists(select 1 from english_assistant_sessions where student_id=sid) then raise exception 'STUDENT_UNAVAILABLE'; end if;
+  if state.active_config_id is null then raise exception 'NOT_CONFIGURED'; end if;
+  if not state.enabled then raise exception 'ENGLISH_PAUSED'; end if;
+  if coalesce(char_length(trim(p_initial_content)),0) not between 1 and 50000 then raise exception 'INVALID_CONTENT'; end if;
+  insert into english_assistant_sessions(owner_id,student_id,config_id) values(p_owner,sid,state.active_config_id) returning * into s;
+  insert into english_assistant_messages(session_id,turn_id,role,content,status)
+    values(s.id,gen_random_uuid(),'assistant',p_initial_content,'complete');
+  return to_jsonb(s);
+end;
+$$;
+
+create or replace function public.begin_english_turn(p_session uuid,p_owner uuid,p_turn uuid,p_content text,p_version int)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare s public.english_assistant_sessions; u public.english_assistant_messages;
+  a public.english_assistant_messages; lease uuid; recent_count int;
+begin
+  if coalesce(char_length(trim(p_content)),0) < 1 or char_length(p_content) > 8000 then raise exception 'INVALID_CONTENT'; end if;
+  select * into s from english_assistant_sessions where id=p_session for update;
+  if not found or s.owner_id <> p_owner then raise exception 'FORBIDDEN'; end if;
+  select * into u from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='user';
+  if found and u.content <> p_content then raise exception 'TURN_CONFLICT'; end if;
+  select * into a from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='assistant';
+  if found and a.status='complete' then
+    return jsonb_build_object('state','complete','user',to_jsonb(u),'assistant',to_jsonb(a),'english_progress',s.english_progress);
+  end if;
+  if not coalesce((select enabled from english_assistant_state where id=1),false) then raise exception 'ENGLISH_PAUSED'; end if;
+  if p_version is null or p_version <> (s.english_progress->>'version')::int then raise exception 'ENGLISH_STATE_CONFLICT'; end if;
+  if (s.english_progress->>'completed')::boolean then raise exception 'ENGLISH_COMPLETED'; end if;
+  if s.locked_until > now() then raise exception 'BUSY'; end if;
+  if s.locked_until is not null then
+    update english_assistant_messages set status='failed',error_code='interrupted' where session_id=s.id and status='pending';
+  end if;
+  if exists(select 1 from english_assistant_messages where session_id=s.id and role='assistant' and status<>'complete' and turn_id<>p_turn) then raise exception 'BUSY'; end if;
+  select count(*) into recent_count from english_assistant_request_events where session_id=s.id and created_at>now()-interval '1 minute';
+  if recent_count >= 8 then raise exception 'RATE_LIMITED'; end if;
+  if s.request_count >= 200 then raise exception 'SESSION_LIMIT'; end if;
+  lease := gen_random_uuid();
+  update english_assistant_sessions set lock_token=lease,locked_until=now()+interval '150 seconds',
+    request_count=request_count+1,updated_at=now() where id=s.id;
+  insert into english_assistant_request_events(session_id) values(s.id);
+  insert into english_assistant_messages(session_id,turn_id,role,content,status) values(s.id,p_turn,'user',p_content,'complete')
+    on conflict(session_id,turn_id,role) do nothing;
+  insert into english_assistant_messages(session_id,turn_id,role,content,status) values(s.id,p_turn,'assistant','','pending')
+    on conflict(session_id,turn_id,role) do update set content='',status='pending',error_code=null;
+  select * into u from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='user';
+  select * into a from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='assistant';
+  return jsonb_build_object('state','acquired','lock_token',lease,'user',to_jsonb(u),'assistant',to_jsonb(a),'english_progress',s.english_progress);
+end;
+$$;
+
+create or replace function public.save_english_reply(p_session uuid,p_turn uuid,p_lease uuid,p_expected jsonb,
+  p_assessment jsonb,p_content text,p_status text default 'complete',p_error text default null)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare s public.english_assistant_sessions; u public.english_assistant_messages; a public.english_assistant_messages;
+  next_state jsonb; stages text[] := array['bridge','objectives','pre_assessment','participatory','post_assessment','summary'];
+  lengths int[] := array[1,1,3,4,2,1]; stage_index int; next_step int; achieved boolean; evidence text;
+begin
+  if p_status is null or p_status not in ('complete','failed') then raise exception 'INVALID_STATUS'; end if;
+  if p_content is null or char_length(p_content)>50000 then raise exception 'INVALID_CONTENT'; end if;
+  select * into s from english_assistant_sessions where id=p_session for update;
+  if not found or p_lease is null or s.lock_token is distinct from p_lease or s.locked_until is null or s.locked_until <= now() then raise exception 'STALE_LEASE'; end if;
+  if p_expected is distinct from s.english_progress then raise exception 'ENGLISH_STATE_CONFLICT'; end if;
+  select * into a from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='assistant' and status='pending';
+  if not found then raise exception 'MISSING_REPLY'; end if;
+  if p_status='failed' then
+    update english_assistant_messages set content='',status='failed',error_code=p_error where id=a.id returning * into a;
+    update english_assistant_sessions set lock_token=null,locked_until=null,updated_at=now() where id=s.id;
+    return jsonb_build_object('message',to_jsonb(a),'english_progress',s.english_progress);
+  end if;
+  if coalesce(char_length(trim(p_content)),0)=0 or jsonb_typeof(p_assessment) is distinct from 'object' or
+     jsonb_typeof(p_assessment->'achieved') is distinct from 'boolean' or
+     jsonb_typeof(p_assessment->'evidence') is distinct from 'string' or
+     jsonb_typeof(p_assessment->'feedback') is distinct from 'string' then raise exception 'INVALID_ENGLISH_ASSESSMENT'; end if;
+  achieved := (p_assessment->>'achieved')::boolean;
+  evidence := p_assessment->>'evidence';
+  if char_length(evidence)>300 or char_length(p_assessment->>'feedback') not between 1 and 6000 then raise exception 'INVALID_ENGLISH_ASSESSMENT'; end if;
+  if achieved and s.english_progress->>'stage' in ('participatory','post_assessment') then
+    select * into u from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='user';
+    if u.id is null or coalesce(char_length(trim(evidence)),0)=0 or position(evidence in u.content)=0 then raise exception 'INVALID_ENGLISH_ASSESSMENT'; end if;
+  end if;
+  stage_index := array_position(stages,s.english_progress->>'stage');
+  if stage_index is null or (s.english_progress->>'completed')::boolean then raise exception 'ENGLISH_COMPLETED'; end if;
+  next_step := (s.english_progress->>'step')::int;
+  if next_step<0 or next_step>=lengths[stage_index] then raise exception 'ENGLISH_STATE_CONFLICT'; end if;
+  next_state := s.english_progress || jsonb_build_object('version',(s.english_progress->>'version')::int+1);
+  if achieved then
+    if stage_index=6 then next_state := next_state || '{"completed":true}'::jsonb;
+    elsif next_step+1<lengths[stage_index] then next_state := next_state || jsonb_build_object('step',next_step+1);
+    else next_state := next_state || jsonb_build_object('stage',stages[stage_index+1],'step',0); end if;
+  end if;
+  update english_assistant_messages set content=p_content,status='complete',error_code=null where id=a.id returning * into a;
+  update english_assistant_sessions set english_progress=next_state,lock_token=null,locked_until=null,updated_at=now() where id=s.id;
+  insert into english_assistant_turns(session_id,turn_id,before_state,after_state,assessment) values(s.id,p_turn,s.english_progress,next_state,p_assessment);
+  return jsonb_build_object('message',to_jsonb(a),'english_progress',next_state);
+end;
+$$;
+
+revoke all on function public.seed_english_config(jsonb,text) from public,anon,authenticated;
+revoke all on function public.publish_english_config(jsonb,text,uuid,boolean,uuid) from public,anon,authenticated;
+revoke all on function public.restore_english_session(uuid) from public,anon,authenticated;
+revoke all on function public.register_english_session(uuid,text,text) from public,anon,authenticated;
+revoke all on function public.begin_english_turn(uuid,uuid,uuid,text,int) from public,anon,authenticated;
+revoke all on function public.save_english_reply(uuid,uuid,uuid,jsonb,jsonb,text,text,text) from public,anon,authenticated;
+grant execute on function public.seed_english_config(jsonb,text) to service_role;
+grant execute on function public.publish_english_config(jsonb,text,uuid,boolean,uuid) to service_role;
+grant execute on function public.restore_english_session(uuid) to service_role;
+grant execute on function public.register_english_session(uuid,text,text) to service_role;
+grant execute on function public.begin_english_turn(uuid,uuid,uuid,text,int) to service_role;
+grant execute on function public.save_english_reply(uuid,uuid,uuid,jsonb,jsonb,text,text,text) to service_role;
+notify pgrst, 'reload schema';
+commit;
+
+-- ===== 006_english_groups.sql =====
+-- Upgrade after 005. Existing English sessions keep their history and remain
+-- ungrouped. New English enrollments use two independent DeepSeek groups.
+begin;
+
+alter table public.english_assistant_state
+  add column if not exists revision bigint not null default 0,
+  add column if not exists base_prompt text not null default '请依据三份 PEEC 学习材料，以清晰、耐心的中文辅导大学英语四六级写作；例句使用英语，每次围绕当前学习活动给出具体反馈。',
+  add column if not exists personality_prompt text;
+
+-- Preserve the published disclosure once during the upgrade, then let the
+-- English course administrator maintain it independently.
+do $$
+begin
+  if not exists(select 1 from information_schema.columns where table_schema='public'
+    and table_name='english_assistant_state' and column_name='disclosure') then
+    alter table public.english_assistant_state add column disclosure text not null
+      default '学号用于关联英语助教学习记录。英语对话将独立保存；请勿输入姓名、联系方式或其他敏感个人信息。';
+    update public.english_assistant_state s set disclosure=c.settings->>'disclosure'
+      from public.english_assistant_configs c where c.id=s.active_config_id
+      and char_length(trim(c.settings->>'disclosure')) between 1 and 2000;
+  end if;
+end;
+$$;
+
+alter table public.english_assistant_configs
+  add column if not exists base_prompt text,
+  add column if not exists personality_prompt text,
+  add column if not exists prompt_revision bigint,
+  add column if not exists source_experiment_id uuid references public.experiment_versions(id),
+  add column if not exists source_revision bigint;
+
+alter table public.english_assistant_sessions
+  add column if not exists group_code text,
+  add column if not exists model_factor text,
+  add column if not exists personality boolean,
+  add column if not exists assigned_at timestamptz;
+
+do $$
+begin
+  if not exists(select 1 from pg_constraint where conrelid='public.english_assistant_sessions'::regclass
+    and conname='english_assistant_group_assignment') then
+    alter table public.english_assistant_sessions add constraint english_assistant_group_assignment check (
+      (group_code is null and model_factor is null and personality is null and assigned_at is null)
+      or (group_code is not null and model_factor is not null and personality is not null and assigned_at is not null
+        and model_factor='deepseek' and group_code in ('deepseek_personality','deepseek_control')
+        and group_code=model_factor || case when personality then '_personality' else '_control' end)
+    );
+  end if;
+end;
+$$;
+create index if not exists english_assistant_sessions_group
+  on public.english_assistant_sessions(group_code) where group_code is not null;
+
+create or replace function public.publish_english_course(p_actor uuid,p_expected_revision bigint,
+  p_enabled boolean,p_disclosure text,p_base_prompt text,p_personality_prompt text)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare state public.english_assistant_state;
+begin
+  if not exists(select 1 from admin_users where user_id=p_actor) then raise exception 'FORBIDDEN'; end if;
+  select * into state from english_assistant_state where id=1 for update;
+  if not found then raise exception 'NOT_CONFIGURED'; end if;
+  if p_expected_revision is null or state.revision <> p_expected_revision then raise exception 'CONFLICT'; end if;
+  if p_enabled is null or coalesce(char_length(trim(p_disclosure)),0) not between 1 and 2000
+    or coalesce(char_length(trim(p_base_prompt)),0) not between 1 and 10000
+    or coalesce(char_length(trim(p_personality_prompt)),0) not between 1 and 10000
+    then raise exception 'INVALID_ENGLISH_COURSE'; end if;
+  update english_assistant_state set revision=revision+1,enabled=p_enabled,
+    disclosure=trim(p_disclosure),base_prompt=trim(p_base_prompt),personality_prompt=trim(p_personality_prompt)
+    where id=1 returning * into state;
+  return to_jsonb(state);
+end;
+$$;
+
+create or replace function public.register_english_session(p_owner uuid,p_student_id text,p_initial_content text)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare sid text := upper(trim(p_student_id)); state public.english_assistant_state;
+  shared public.study_state; source public.experiment_versions; s public.english_assistant_sessions;
+  selected_group text; has_personality boolean; selected_config uuid; connection jsonb; effective jsonb;
+  personality_text text; ciphertext text;
+begin
+  if sid is null or sid !~ '^[0-9A-Z_-]{1,32}$' then raise exception 'INVALID_STUDENT_ID'; end if;
+  -- Serialize only English allocation, prompt publication and its counts.
+  select * into state from english_assistant_state where id=1 for update;
+  select * into s from english_assistant_sessions where owner_id=p_owner for update;
+  if found then
+    if s.student_id<>sid then raise exception 'IDENTITY_BOUND'; end if;
+    return restore_english_session(p_owner);
+  end if;
+  if exists(select 1 from english_assistant_sessions where student_id=sid) then raise exception 'STUDENT_UNAVAILABLE'; end if;
+  if not state.enabled then raise exception 'ENGLISH_PAUSED'; end if;
+  if coalesce(char_length(trim(p_initial_content)),0) not between 1 and 50000 then raise exception 'INVALID_CONTENT'; end if;
+
+  -- Shared model connection is read-only. Original experiment publication may
+  -- not replace it halfway through this enrollment; its enabled flag is ignored.
+  select * into shared from study_state where id=1 for share;
+  if shared.active_experiment_id is null then raise exception 'NOT_CONFIGURED'; end if;
+  select * into source from experiment_versions where id=shared.active_experiment_id;
+  connection := source.settings->'connections'->'deepseek';
+  ciphertext := source.encrypted_keys->>'deepseek';
+  personality_text := coalesce(state.personality_prompt,source.settings->>'personality_prompt');
+  if jsonb_typeof(connection) is distinct from 'object'
+    or coalesce(char_length(trim(connection->>'model')),0)=0
+    or coalesce(char_length(trim(connection->>'api_base_url')),0)=0
+    or coalesce(connection->>'protocol','') not in ('openai-chat','openai-responses','anthropic')
+    or coalesce(char_length(trim(ciphertext)),0)=0
+    or coalesce(char_length(trim(personality_text)),0) not between 1 and 10000
+    or coalesce(char_length(trim(state.base_prompt)),0) not between 1 and 10000
+    then raise exception 'NOT_CONFIGURED'; end if;
+
+  select groups.code into selected_group from
+    (values ('deepseek_personality'),('deepseek_control')) as groups(code)
+    left join english_assistant_sessions existing on existing.group_code=groups.code
+    group by groups.code order by count(existing.id),random() limit 1;
+  has_personality := selected_group='deepseek_personality';
+  -- Explicit field selection prevents original prompts, questions, public text
+  -- or allocation state from being copied into this English learning snapshot.
+  effective := jsonb_build_object(
+    'protocol',connection->'protocol',
+    'anthropic_auth',coalesce(connection->'anthropic_auth','"x-api-key"'::jsonb),
+    'anthropic_workspace',coalesce(connection->'anthropic_workspace','""'::jsonb),
+    'api_base_url',connection->'api_base_url',
+    'api_url_mode',coalesce(connection->'api_url_mode','"base"'::jsonb),
+    'model',connection->'model',
+    'temperature',coalesce(connection->'temperature','null'::jsonb),
+    'max_tokens',coalesce(connection->'max_tokens','2048'::jsonb),
+    'token_parameter',coalesce(connection->'token_parameter','"max_tokens"'::jsonb),
+    'title','英语助教','assistant_name','英语助教',
+    'welcome_message','依据三份 PEEC 学习材料，按 BOPPPS 六阶段完成大学英语四六级段落写作学习。',
+    'disclosure',state.disclosure,
+    'system_prompt','BOPPPS PEEC teaching; the server composes the current activity and learning materials.'
+  );
+  insert into english_assistant_configs(settings,api_key_ciphertext,base_prompt,personality_prompt,
+    prompt_revision,source_experiment_id,source_revision)
+    values(effective,ciphertext,state.base_prompt,case when has_personality then trim(personality_text) else null end,
+      state.revision,source.id,source.revision) returning id into selected_config;
+  insert into english_assistant_sessions(owner_id,student_id,config_id,group_code,model_factor,personality,assigned_at)
+    values(p_owner,sid,selected_config,selected_group,'deepseek',has_personality,now()) returning * into s;
+  insert into english_assistant_messages(session_id,turn_id,role,content,status)
+    values(s.id,gen_random_uuid(),'assistant',p_initial_content,'complete');
+  return to_jsonb(s);
+end;
+$$;
+
+create or replace view public.admin_english_conversation_records as
+  select s.id,s.config_id,s.student_id,s.group_code,s.model_factor,s.personality,s.assigned_at,
+    s.created_at,s.updated_at,s.request_count,s.participant_code,s.title,s.english_progress,
+    c.source_experiment_id as experiment_id,c.source_revision as experiment_revision,c.prompt_revision
+  from public.english_assistant_sessions s join public.english_assistant_configs c on c.id=s.config_id;
+revoke all on public.admin_english_conversation_records from public,anon,authenticated;
+grant select on public.admin_english_conversation_records to service_role;
+
+create or replace function public.english_group_counts()
+returns table(group_code text,enrolled bigint) language sql stable set search_path = public, pg_temp as $$
+  select groups.code,count(s.id) from (values ('deepseek_personality'),('deepseek_control')) as groups(code)
+    left join public.english_assistant_sessions s on s.group_code=groups.code
+    group by groups.code order by groups.code;
+$$;
+
+-- Existing pre-group snapshots remain available for historical restoration.
+-- New writes use shared DeepSeek and the independent course-prompt publisher.
+revoke all on function public.seed_english_config(jsonb,text) from public,anon,authenticated,service_role;
+revoke all on function public.publish_english_config(jsonb,text,uuid,boolean,uuid) from public,anon,authenticated,service_role;
+revoke all on function public.publish_english_course(uuid,bigint,boolean,text,text,text) from public,anon,authenticated;
+revoke all on function public.register_english_session(uuid,text,text) from public,anon,authenticated;
+revoke all on function public.english_group_counts() from public,anon,authenticated;
+grant execute on function public.publish_english_course(uuid,bigint,boolean,text,text,text) to service_role;
+grant execute on function public.register_english_session(uuid,text,text) to service_role;
+grant execute on function public.english_group_counts() to service_role;
+
+commit;
+
+notify pgrst, 'reload schema';
+
+-- ===== 007_english_curriculum_and_delete.sql =====
+-- Upgrade after 006. Keep existing English course snapshots and history.
+-- Six BOPPPS stages stay fixed; administrators may edit their activities.
+begin;
+
+create or replace function public.english_curriculum_valid(p_curriculum jsonb)
+returns boolean language plpgsql immutable set search_path = pg_catalog, pg_temp as $$
+declare stage_key text; stage_value jsonb; activity jsonb; limits jsonb;
+  total_activities int := 0;
+  stages text[] := array['bridge','objectives','pre_assessment','participatory','post_assessment','summary'];
+begin
+  if p_curriculum is null or jsonb_typeof(p_curriculum) is distinct from 'object' then return false; end if;
+  if not (p_curriculum ?& stages) or (select count(*) from jsonb_object_keys(p_curriculum)) <> 6 then return false; end if;
+  foreach stage_key in array stages loop
+    stage_value := p_curriculum->stage_key;
+    if jsonb_typeof(stage_value) is distinct from 'object' then return false; end if;
+    if not (stage_value ?& array['description','activities'])
+      or (select count(*) from jsonb_object_keys(stage_value)) <> 2 then return false; end if;
+    if jsonb_typeof(stage_value->'description') is distinct from 'string'
+      or char_length(btrim(stage_value->>'description')) not between 1 and 300
+      or jsonb_typeof(stage_value->'activities') is distinct from 'array' then return false; end if;
+    if jsonb_array_length(stage_value->'activities') not between 1 and 8 then return false; end if;
+    total_activities := total_activities + jsonb_array_length(stage_value->'activities');
+    if total_activities > 24 then return false; end if;
+    for activity in select value from jsonb_array_elements(stage_value->'activities') loop
+      if jsonb_typeof(activity) is distinct from 'object' then return false; end if;
+      if not (activity ?& array['title','prompt','criterion'])
+        or exists(select 1 from jsonb_object_keys(activity) as fields(name)
+          where name not in ('title','prompt','criterion','word_limit')) then return false; end if;
+      if jsonb_typeof(activity->'title') is distinct from 'string'
+        or char_length(btrim(activity->>'title')) not between 1 and 120
+        or jsonb_typeof(activity->'prompt') is distinct from 'string'
+        or char_length(btrim(activity->>'prompt')) not between 1 and 4000
+        or jsonb_typeof(activity->'criterion') is distinct from 'string'
+        or char_length(btrim(activity->>'criterion')) not between 1 and 2000 then return false; end if;
+      if activity ? 'word_limit' and jsonb_typeof(activity->'word_limit') is distinct from 'null' then
+        limits := activity->'word_limit';
+        if jsonb_typeof(limits) is distinct from 'object' then return false; end if;
+        if not (limits ?& array['min','max']) or (select count(*) from jsonb_object_keys(limits)) <> 2 then return false; end if;
+        if jsonb_typeof(limits->'min') is distinct from 'number'
+          or jsonb_typeof(limits->'max') is distinct from 'number' then return false; end if;
+        if (limits->>'min')::numeric not between 1 and 1000
+          or (limits->>'max')::numeric not between 1 and 1000
+          or trunc((limits->>'min')::numeric) <> (limits->>'min')::numeric
+          or trunc((limits->>'max')::numeric) <> (limits->>'max')::numeric
+          or (limits->>'max')::numeric < (limits->>'min')::numeric then return false; end if;
+      end if;
+    end loop;
+  end loop;
+  return true;
+end;
+$$;
+
+-- Null means the original twelve activities [1,1,3,4,2,1]. No history rewrite.
+alter table public.english_assistant_state add column if not exists curriculum jsonb;
+alter table public.english_assistant_configs add column if not exists curriculum jsonb;
+do $$
+begin
+  if not exists(select 1 from pg_constraint where conrelid='public.english_assistant_state'::regclass
+    and conname='english_assistant_state_curriculum') then
+    alter table public.english_assistant_state add constraint english_assistant_state_curriculum
+      check (curriculum is null or public.english_curriculum_valid(curriculum));
+  end if;
+  if not exists(select 1 from pg_constraint where conrelid='public.english_assistant_configs'::regclass
+    and conname='english_assistant_configs_curriculum') then
+    alter table public.english_assistant_configs add constraint english_assistant_configs_curriculum
+      check (curriculum is null or public.english_curriculum_valid(curriculum));
+  end if;
+end;
+$$;
+
+drop function if exists public.publish_english_course(uuid,bigint,boolean,text,text,text);
+create or replace function public.publish_english_course(p_actor uuid,p_expected_revision bigint,
+  p_enabled boolean,p_disclosure text,p_base_prompt text,p_personality_prompt text,p_curriculum jsonb)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare state public.english_assistant_state;
+begin
+  if not exists(select 1 from admin_users where user_id=p_actor) then raise exception 'FORBIDDEN'; end if;
+  select * into state from english_assistant_state where id=1 for update;
+  if not found then raise exception 'NOT_CONFIGURED'; end if;
+  if p_expected_revision is null or state.revision <> p_expected_revision then raise exception 'CONFLICT'; end if;
+  if p_enabled is null or coalesce(char_length(trim(p_disclosure)),0) not between 1 and 2000
+    or coalesce(char_length(trim(p_base_prompt)),0) not between 1 and 10000
+    or coalesce(char_length(trim(p_personality_prompt)),0) not between 1 and 10000
+    or not public.english_curriculum_valid(p_curriculum) then raise exception 'INVALID_ENGLISH_COURSE'; end if;
+  update english_assistant_state set revision=revision+1,enabled=p_enabled,
+    disclosure=trim(p_disclosure),base_prompt=trim(p_base_prompt),personality_prompt=trim(p_personality_prompt),
+    curriculum=p_curriculum where id=1 returning * into state;
+  return to_jsonb(state);
+end;
+$$;
+
+drop function if exists public.register_english_session(uuid,text,text);
+create or replace function public.register_english_session(p_owner uuid,p_student_id text,p_initial_content text,
+  p_expected_revision bigint default null)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare sid text := upper(trim(p_student_id)); state public.english_assistant_state;
+  shared public.study_state; source public.experiment_versions; s public.english_assistant_sessions;
+  selected_group text; has_personality boolean; selected_config uuid; connection jsonb; effective jsonb;
+  personality_text text; ciphertext text;
+begin
+  if sid is null or sid !~ '^[0-9A-Z_-]{1,32}$' then raise exception 'INVALID_STUDENT_ID'; end if;
+  -- Serialize only English allocation, prompt publication and its counts.
+  select * into state from english_assistant_state where id=1 for update;
+  if not found then raise exception 'NOT_CONFIGURED'; end if;
+  select * into s from english_assistant_sessions where owner_id=p_owner for update;
+  if found then
+    if s.student_id<>sid then raise exception 'IDENTITY_BOUND'; end if;
+    return restore_english_session(p_owner);
+  end if;
+  if p_expected_revision is not null and state.revision <> p_expected_revision then raise exception 'CONFLICT'; end if;
+  if exists(select 1 from english_assistant_sessions where student_id=sid) then raise exception 'STUDENT_UNAVAILABLE'; end if;
+  if not state.enabled then raise exception 'ENGLISH_PAUSED'; end if;
+  if coalesce(char_length(trim(p_initial_content)),0) not between 1 and 50000 then raise exception 'INVALID_CONTENT'; end if;
+
+  -- Shared model connection is read-only. Original experiment publication may
+  -- not replace it halfway through this enrollment; its enabled flag is ignored.
+  select * into shared from study_state where id=1 for share;
+  if shared.active_experiment_id is null then raise exception 'NOT_CONFIGURED'; end if;
+  select * into source from experiment_versions where id=shared.active_experiment_id;
+  connection := source.settings->'connections'->'deepseek';
+  ciphertext := source.encrypted_keys->>'deepseek';
+  personality_text := coalesce(state.personality_prompt,source.settings->>'personality_prompt');
+  if jsonb_typeof(connection) is distinct from 'object'
+    or coalesce(char_length(trim(connection->>'model')),0)=0
+    or coalesce(char_length(trim(connection->>'api_base_url')),0)=0
+    or coalesce(connection->>'protocol','') not in ('openai-chat','openai-responses','anthropic')
+    or coalesce(char_length(trim(ciphertext)),0)=0
+    or coalesce(char_length(trim(personality_text)),0) not between 1 and 10000
+    or coalesce(char_length(trim(state.base_prompt)),0) not between 1 and 10000
+    then raise exception 'NOT_CONFIGURED'; end if;
+
+  select groups.code into selected_group from
+    (values ('deepseek_personality'),('deepseek_control')) as groups(code)
+    left join english_assistant_sessions existing on existing.group_code=groups.code
+    group by groups.code order by count(existing.id),random() limit 1;
+  has_personality := selected_group='deepseek_personality';
+  -- Explicit field selection prevents original prompts, questions, public text
+  -- or allocation state from being copied into this English learning snapshot.
+  effective := jsonb_build_object(
+    'protocol',connection->'protocol',
+    'anthropic_auth',coalesce(connection->'anthropic_auth','"x-api-key"'::jsonb),
+    'anthropic_workspace',coalesce(connection->'anthropic_workspace','""'::jsonb),
+    'api_base_url',connection->'api_base_url',
+    'api_url_mode',coalesce(connection->'api_url_mode','"base"'::jsonb),
+    'model',connection->'model',
+    'temperature',coalesce(connection->'temperature','null'::jsonb),
+    'max_tokens',coalesce(connection->'max_tokens','2048'::jsonb),
+    'token_parameter',coalesce(connection->'token_parameter','"max_tokens"'::jsonb),
+    'title','英语助教','assistant_name','英语助教',
+    'welcome_message','依据三份 PEEC 学习材料，按 BOPPPS 六阶段完成大学英语四六级段落写作学习。',
+    'disclosure',state.disclosure,
+    'system_prompt','BOPPPS PEEC teaching; the server composes the current activity and learning materials.'
+  );
+  insert into english_assistant_configs(settings,api_key_ciphertext,base_prompt,personality_prompt,
+    prompt_revision,source_experiment_id,source_revision,curriculum)
+    values(effective,ciphertext,state.base_prompt,case when has_personality then trim(personality_text) else null end,
+      state.revision,source.id,source.revision,state.curriculum) returning id into selected_config;
+  insert into english_assistant_sessions(owner_id,student_id,config_id,group_code,model_factor,personality,assigned_at)
+    values(p_owner,sid,selected_config,selected_group,'deepseek',has_personality,now()) returning * into s;
+  insert into english_assistant_messages(session_id,turn_id,role,content,status)
+    values(s.id,gen_random_uuid(),'assistant',p_initial_content,'complete');
+  return to_jsonb(s);
+end;
+$$;
+
+create or replace function public.save_english_reply(p_session uuid,p_turn uuid,p_lease uuid,p_expected jsonb,
+  p_assessment jsonb,p_content text,p_status text default 'complete',p_error text default null)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare s public.english_assistant_sessions; u public.english_assistant_messages; a public.english_assistant_messages;
+  next_state jsonb; stages text[] := array['bridge','objectives','pre_assessment','participatory','post_assessment','summary'];
+  lengths int[] := array[1,1,3,4,2,1]; stage_index int; next_step int; achieved boolean; evidence text;
+  curriculum jsonb; activity_index int;
+begin
+  if p_status is null or p_status not in ('complete','failed') then raise exception 'INVALID_STATUS'; end if;
+  if p_content is null or char_length(p_content)>50000 then raise exception 'INVALID_CONTENT'; end if;
+  select * into s from english_assistant_sessions where id=p_session for update;
+  if not found or p_lease is null or s.lock_token is distinct from p_lease or s.locked_until is null or s.locked_until <= now() then raise exception 'STALE_LEASE'; end if;
+  if p_expected is distinct from s.english_progress then raise exception 'ENGLISH_STATE_CONFLICT'; end if;
+  select * into a from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='assistant' and status='pending';
+  if not found then raise exception 'MISSING_REPLY'; end if;
+  if p_status='failed' then
+    update english_assistant_messages set content='',status='failed',error_code=p_error where id=a.id returning * into a;
+    update english_assistant_sessions set lock_token=null,locked_until=null,updated_at=now() where id=s.id;
+    return jsonb_build_object('message',to_jsonb(a),'english_progress',s.english_progress);
+  end if;
+  if coalesce(char_length(trim(p_content)),0)=0 or jsonb_typeof(p_assessment) is distinct from 'object' or
+     jsonb_typeof(p_assessment->'achieved') is distinct from 'boolean' or
+     jsonb_typeof(p_assessment->'evidence') is distinct from 'string' or
+     jsonb_typeof(p_assessment->'feedback') is distinct from 'string' then raise exception 'INVALID_ENGLISH_ASSESSMENT'; end if;
+  achieved := (p_assessment->>'achieved')::boolean;
+  evidence := p_assessment->>'evidence';
+  if char_length(evidence)>300 or char_length(p_assessment->>'feedback') not between 1 and 6000 then raise exception 'INVALID_ENGLISH_ASSESSMENT'; end if;
+  if achieved and s.english_progress->>'stage' in ('participatory','post_assessment') then
+    select * into u from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='user';
+    if u.id is null or coalesce(char_length(trim(evidence)),0)=0 or position(evidence in u.content)=0 then raise exception 'INVALID_ENGLISH_ASSESSMENT'; end if;
+  end if;
+  stage_index := array_position(stages,s.english_progress->>'stage');
+  if stage_index is null or (s.english_progress->>'completed')::boolean then raise exception 'ENGLISH_COMPLETED'; end if;
+  select c.curriculum into curriculum from english_assistant_configs c where c.id=s.config_id;
+  if curriculum is not null then
+    for activity_index in 1..6 loop
+      lengths[activity_index] := jsonb_array_length(curriculum->stages[activity_index]->'activities');
+    end loop;
+  end if;
+  next_step := (s.english_progress->>'step')::int;
+  if next_step<0 or next_step>=lengths[stage_index] then raise exception 'ENGLISH_STATE_CONFLICT'; end if;
+  next_state := s.english_progress || jsonb_build_object('version',(s.english_progress->>'version')::int+1);
+  if achieved then
+    if next_step+1<lengths[stage_index] then next_state := next_state || jsonb_build_object('step',next_step+1);
+    elsif stage_index=6 then next_state := next_state || '{"completed":true}'::jsonb;
+    else next_state := next_state || jsonb_build_object('stage',stages[stage_index+1],'step',0); end if;
+  end if;
+  update english_assistant_messages set content=p_content,status='complete',error_code=null where id=a.id returning * into a;
+  update english_assistant_sessions set english_progress=next_state,lock_token=null,locked_until=null,updated_at=now() where id=s.id;
+  insert into english_assistant_turns(session_id,turn_id,before_state,after_state,assessment) values(s.id,p_turn,s.english_progress,next_state,p_assessment);
+  return jsonb_build_object('message',to_jsonb(a),'english_progress',next_state);
+end;
+$$;
+
+create table if not exists public.english_assistant_delete_audit (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null,
+  deleted_by uuid not null,
+  deleted_at timestamptz not null default now(),
+  student_id text not null,
+  participant_code text not null,
+  group_code text,
+  prompt_revision bigint,
+  messages_count bigint not null check (messages_count >= 0)
+);
+alter table public.english_assistant_delete_audit enable row level security;
+revoke all on public.english_assistant_delete_audit from public,anon,authenticated;
+grant all on public.english_assistant_delete_audit to service_role;
+
+create or replace function public.admin_delete_english_conversation(p_conversation uuid,p_actor uuid)
+returns uuid language plpgsql security definer set search_path = '' as $$
+declare target public.english_assistant_sessions; revision bigint; message_total bigint;
+begin
+  if not exists(select 1 from public.admin_users where user_id=p_actor) then raise exception 'FORBIDDEN'; end if;
+  -- Match English registration/publication lock order. Bloom state is untouched.
+  perform 1 from public.english_assistant_state where id=1 for update;
+  if not found then raise exception 'NOT_CONFIGURED'; end if;
+  select * into target from public.english_assistant_sessions where id=p_conversation for update;
+  if not found then raise exception 'CONVERSATION_NOT_FOUND'; end if;
+  if target.locked_until > clock_timestamp() then raise exception 'CONVERSATION_BUSY'; end if;
+  select prompt_revision into revision from public.english_assistant_configs where id=target.config_id;
+  select count(*) into message_total from public.english_assistant_messages where session_id=target.id;
+  insert into public.english_assistant_delete_audit(conversation_id,deleted_by,student_id,participant_code,
+    group_code,prompt_revision,messages_count)
+    values(target.id,p_actor,target.student_id,target.participant_code,target.group_code,revision,message_total);
+  -- Existing foreign keys remove only this English session's messages, requests
+  -- and assessment turns. Its owner and student binding are released together.
+  delete from public.english_assistant_sessions where id=target.id;
+  delete from public.english_assistant_configs c where c.id=target.config_id
+    and not exists(select 1 from public.english_assistant_sessions s where s.config_id=c.id)
+    and not exists(select 1 from public.english_assistant_state state where state.active_config_id=c.id);
+  return target.id;
+end;
+$$;
+
+revoke all on function public.english_curriculum_valid(jsonb) from public,anon,authenticated;
+revoke all on function public.publish_english_course(uuid,bigint,boolean,text,text,text,jsonb) from public,anon,authenticated;
+revoke all on function public.register_english_session(uuid,text,text,bigint) from public,anon,authenticated;
+revoke all on function public.save_english_reply(uuid,uuid,uuid,jsonb,jsonb,text,text,text) from public,anon,authenticated;
+revoke all on function public.admin_delete_english_conversation(uuid,uuid) from public,anon,authenticated;
+grant execute on function public.english_curriculum_valid(jsonb) to service_role;
+grant execute on function public.publish_english_course(uuid,bigint,boolean,text,text,text,jsonb) to service_role;
+grant execute on function public.register_english_session(uuid,text,text,bigint) to service_role;
+grant execute on function public.save_english_reply(uuid,uuid,uuid,jsonb,jsonb,text,text,text) to service_role;
+grant execute on function public.admin_delete_english_conversation(uuid,uuid) to service_role;
+
+commit;
+
+notify pgrst, 'reload schema';
+
+-- ===== 008_english_learning_pause.sql =====
+-- Upgrade after 007. Learning pauses belong to one English session only.
+-- Existing teaching progress and histories are preserved. Safe to run again.
+begin;
+
+alter table public.english_assistant_sessions
+  add column if not exists english_paused boolean not null default false;
+
+-- Controls are recorded separately from teaching assessments, and are removed
+-- with their session. Message pairs remain in the normal conversation history.
+create table if not exists public.english_assistant_learning_controls (
+  session_id uuid not null references public.english_assistant_sessions(id) on delete cascade,
+  turn_id uuid not null,
+  paused boolean not null,
+  before_state jsonb not null,
+  after_state jsonb not null,
+  created_at timestamptz not null default now(),
+  primary key(session_id,turn_id)
+);
+create index if not exists english_assistant_controls_recent
+  on public.english_assistant_learning_controls(session_id,created_at desc);
+alter table public.english_assistant_learning_controls enable row level security;
+revoke all on public.english_assistant_learning_controls from public,anon,authenticated;
+grant all on public.english_assistant_learning_controls to service_role;
+
+create or replace function public.set_english_learning_pause(p_session uuid,p_owner uuid,p_turn uuid,
+  p_content text,p_version int,p_paused boolean)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare s public.english_assistant_sessions; control public.english_assistant_learning_controls;
+  u public.english_assistant_messages; a public.english_assistant_messages;
+  next_state jsonb; reply text; recent_control_count int;
+begin
+  if coalesce(char_length(trim(p_content)),0)<1 or char_length(p_content)>8000 then raise exception 'INVALID_CONTENT'; end if;
+  if p_paused is null or p_turn is null then raise exception 'INVALID_ENGLISH_CONTROL'; end if;
+  select * into s from english_assistant_sessions where id=p_session for update;
+  if not found or s.owner_id is distinct from p_owner then raise exception 'FORBIDDEN'; end if;
+  select * into control from english_assistant_learning_controls where session_id=s.id and turn_id=p_turn;
+  if found then
+    select * into u from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='user';
+    select * into a from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='assistant';
+    if control.paused is distinct from p_paused or u.id is null or u.content is distinct from p_content
+      or a.id is null or a.status is distinct from 'complete' then raise exception 'TURN_CONFLICT'; end if;
+    return jsonb_build_object('user',to_jsonb(u),'assistant',to_jsonb(a),
+      'english_progress',s.english_progress,'english_paused',s.english_paused);
+  end if;
+  -- A teaching turn cannot be repurposed as a learning control, including a
+  -- failed turn. Controls use their own turn id and may bypass failed pairs.
+  if exists(select 1 from english_assistant_messages where session_id=s.id and turn_id=p_turn)
+    then raise exception 'TURN_CONFLICT'; end if;
+  if p_version is null or p_version <> (s.english_progress->>'version')::int then raise exception 'ENGLISH_STATE_CONFLICT'; end if;
+  if (s.english_progress->>'completed')::boolean then raise exception 'ENGLISH_COMPLETED'; end if;
+  if s.locked_until > now() then raise exception 'BUSY'; end if;
+  -- Controls have their own rolling limit, independent of teaching requests.
+  -- Successful retries above return before this check and consume no event.
+  select count(*) into recent_control_count from english_assistant_learning_controls
+    where session_id=s.id and created_at>now()-interval '1 minute';
+  if recent_control_count>=8 then raise exception 'RATE_LIMITED'; end if;
+  if s.locked_until is not null then
+    update english_assistant_messages set status='failed',error_code='interrupted'
+      where session_id=s.id and status='pending';
+  end if;
+  next_state := s.english_progress || jsonb_build_object('version',(s.english_progress->>'version')::int+1);
+  reply := case when p_paused
+    then '可以先休息一下。本次学习已暂停，当前题目和进度已保留。准备好后，点击“继续学习”即可从这里继续。'
+    else '欢迎回来，学习已继续。请接着完成暂停前的当前活动。' end;
+  insert into english_assistant_messages(session_id,turn_id,role,content,status)
+    values(s.id,p_turn,'user',p_content,'complete') returning * into u;
+  insert into english_assistant_messages(session_id,turn_id,role,content,status)
+    values(s.id,p_turn,'assistant',reply,'complete') returning * into a;
+  insert into english_assistant_learning_controls(session_id,turn_id,paused,before_state,after_state)
+    values(s.id,p_turn,p_paused,s.english_progress,next_state);
+  update english_assistant_sessions set english_paused=p_paused,english_progress=next_state,
+    lock_token=null,locked_until=null,updated_at=now() where id=s.id;
+  return jsonb_build_object('user',to_jsonb(u),'assistant',to_jsonb(a),
+    'english_progress',next_state,'english_paused',p_paused);
+end;
+$$;
+
+create or replace function public.begin_english_turn(p_session uuid,p_owner uuid,p_turn uuid,p_content text,p_version int)
+returns jsonb language plpgsql security definer set search_path = public, pg_temp as $$
+declare s public.english_assistant_sessions; u public.english_assistant_messages;
+  a public.english_assistant_messages; lease uuid; recent_count int;
+begin
+  if coalesce(char_length(trim(p_content)),0) < 1 or char_length(p_content) > 8000 then raise exception 'INVALID_CONTENT'; end if;
+  select * into s from english_assistant_sessions where id=p_session for update;
+  if not found or s.owner_id is distinct from p_owner then raise exception 'FORBIDDEN'; end if;
+  select * into u from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='user';
+  if found and u.content <> p_content then raise exception 'TURN_CONFLICT'; end if;
+  select * into a from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='assistant';
+  if found and a.status='complete' then
+    return jsonb_build_object('state','complete','user',to_jsonb(u),'assistant',to_jsonb(a),'english_progress',s.english_progress,'english_paused',s.english_paused);
+  end if;
+  if s.english_paused then raise exception 'ENGLISH_LEARNING_PAUSED'; end if;
+  if not coalesce((select enabled from english_assistant_state where id=1),false) then raise exception 'ENGLISH_PAUSED'; end if;
+  if p_version is null or p_version <> (s.english_progress->>'version')::int then raise exception 'ENGLISH_STATE_CONFLICT'; end if;
+  if (s.english_progress->>'completed')::boolean then raise exception 'ENGLISH_COMPLETED'; end if;
+  if s.locked_until > now() then raise exception 'BUSY'; end if;
+  if s.locked_until is not null then
+    update english_assistant_messages set status='failed',error_code='interrupted' where session_id=s.id and status='pending';
+  end if;
+  if exists(select 1 from english_assistant_messages where session_id=s.id and role='assistant' and status<>'complete' and turn_id<>p_turn) then raise exception 'BUSY'; end if;
+  select count(*) into recent_count from english_assistant_request_events where session_id=s.id and created_at>now()-interval '1 minute';
+  if recent_count >= 8 then raise exception 'RATE_LIMITED'; end if;
+  if s.request_count >= 200 then raise exception 'SESSION_LIMIT'; end if;
+  lease := gen_random_uuid();
+  update english_assistant_sessions set lock_token=lease,locked_until=now()+interval '150 seconds',
+    request_count=request_count+1,updated_at=now() where id=s.id;
+  insert into english_assistant_request_events(session_id) values(s.id);
+  insert into english_assistant_messages(session_id,turn_id,role,content,status) values(s.id,p_turn,'user',p_content,'complete')
+    on conflict(session_id,turn_id,role) do nothing;
+  insert into english_assistant_messages(session_id,turn_id,role,content,status) values(s.id,p_turn,'assistant','','pending')
+    on conflict(session_id,turn_id,role) do update set content='',status='pending',error_code=null;
+  select * into u from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='user';
+  select * into a from english_assistant_messages where session_id=s.id and turn_id=p_turn and role='assistant';
+  return jsonb_build_object('state','acquired','lock_token',lease,'user',to_jsonb(u),'assistant',to_jsonb(a),'english_progress',s.english_progress,'english_paused',s.english_paused);
+end;
+$$;
+
+-- CREATE OR REPLACE resets view options. Preserve the existing invoker/barrier
+-- settings while appending the new column in the original column order.
+do $view$
+declare prior_options text[];
+begin
+  select reloptions into prior_options from pg_class
+    where oid='public.admin_english_conversation_records'::regclass;
+  execute $definition$create or replace view public.admin_english_conversation_records as
+  select s.id,s.config_id,s.student_id,s.group_code,s.model_factor,s.personality,s.assigned_at,
+    s.created_at,s.updated_at,s.request_count,s.participant_code,s.title,s.english_progress,
+    c.source_experiment_id as experiment_id,c.source_revision as experiment_revision,c.prompt_revision,
+    s.english_paused
+  from public.english_assistant_sessions s join public.english_assistant_configs c on c.id=s.config_id$definition$;
+  if coalesce(cardinality(prior_options),0)>0 then
+    execute format('alter view public.admin_english_conversation_records set (%s)',array_to_string(prior_options,', '));
+  end if;
+end;
+$view$;
+revoke all on public.admin_english_conversation_records from public,anon,authenticated;
+grant select on public.admin_english_conversation_records to service_role;
+
+revoke all on function public.set_english_learning_pause(uuid,uuid,uuid,text,int,boolean) from public,anon,authenticated;
+revoke all on function public.begin_english_turn(uuid,uuid,uuid,text,int) from public,anon,authenticated;
+grant execute on function public.set_english_learning_pause(uuid,uuid,uuid,text,int,boolean) to service_role;
+grant execute on function public.begin_english_turn(uuid,uuid,uuid,text,int) to service_role;
+
+commit;
+
+notify pgrst, 'reload schema';

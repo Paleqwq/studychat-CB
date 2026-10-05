@@ -1,0 +1,17 @@
+node_modules/
+.next/
+.next-*/
+.env*
+!.env.example
+.vercel/
+.cloudbase/
+.tcb/
+.edgeone/
+*.pem
+*.key
+*.p12
+*.pfx
+*.tsbuildinfo
+coverage/
+artifacts/
+*.log

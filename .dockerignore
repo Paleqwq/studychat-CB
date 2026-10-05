@@ -1,0 +1,26 @@
+# Credentials must never enter the build context, including nested env files.
+.env*
+**/.env*
+*.pem
+*.key
+*.p12
+*.pfx
+**/*.pem
+**/*.key
+.git
+.git/**
+.vercel
+.cloudbase
+.tcb
+node_modules
+**/node_modules
+.next
+.next*
+artifacts
+outputs
+coverage
+**/*.log
+*.tsbuildinfo
+.codex
+.idea
+.vscode
