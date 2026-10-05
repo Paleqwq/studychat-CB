@@ -2,7 +2,7 @@
 
 核对日期：2026-10-05。项目：独立的 `studychat-CB`。
 
-- `npm test`：50 个文件、749 项测试全部通过，含 CloudBase 身份隔离、服务端认证、数据库事务、权限、BOPPPS、暂停和删除功能。
+- `npm test`：51 个文件、755 项测试全部通过，含 CloudBase 身份隔离、服务端认证、数据库事务、权限、BOPPPS、暂停、删除及源码部署公开构建配置。
 - `npm run typecheck`：通过；生产构建中的 TypeScript 检查也通过。
 - `node cloudbase/scripts/build-schema.mjs --check`：生成结果与已审阅源一致；单条原子 SQL 的 19 项数据库测试通过。
 - `npm run build`：使用 CloudBase 模式的虚拟公开配置成功生成 standalone 产物。

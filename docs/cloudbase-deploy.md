@@ -116,7 +116,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 
 ## 5. 创建容器型云托管服务
 
-在 CloudBase 云托管创建 `studychat-cb-test` 测试服务。选择 **容器型／Dockerfile 部署**，绑定独立私有 GitHub 仓库 `studychat-CB`；首次绑定按控制台引导授权读取该仓库。仓库根目录包含 Dockerfile，构建上下文使用根目录。[官方私有 Git 部署](https://docs.cloudbase.net/run/deploy/deploy/deploying-git)
+在 CloudBase 云托管创建 `studychat-cb-test` 测试服务。选择 **容器型／Dockerfile 部署**，绑定 GitHub 仓库 `studychat-CB`；本仓库现已公开，私有仓库则按控制台引导授权读取。仓库根目录包含 Dockerfile，构建上下文使用根目录。[官方 Git 部署](https://docs.cloudbase.net/run/deploy/deploy/deploying-git)
 
 | 服务设置 | 值 |
 |---|---|
@@ -131,6 +131,25 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 上述资源是测试起点，并不保证 70 人同时作答。Dockerfile 已构建 Next.js standalone 并设置非 root 运行用户、静态资源、端口和健康检查。[官方 Node.js 容器部署](https://docs.cloudbase.net/run/quick-start/dockerize-node)
 
 把第 4 节公开值配置成控制台的 **Docker 构建参数**，把私钥配置为**运行环境变量**。如果控制台只提供运行环境变量，没有构建参数入口，采用下述镜像部署方式，不能假定运行变量会自动传给 Docker build。
+
+### 使用本机 CloudBase MCP 上传源码
+
+`manageCloudRun` 的源码部署接口没有 Docker build args 字段。此时在干净部署目录中生成 `cloudbase/public-build.json`，仅允许以下四项公开配置：
+
+```json
+{
+  "NEXT_PUBLIC_DATA_BACKEND": "cloudbase",
+  "NEXT_PUBLIC_CLOUDBASE_ENV_ID": "你的PG环境ID",
+  "NEXT_PUBLIC_CLOUDBASE_REGION": "ap-shanghai",
+  "NEXT_PUBLIC_CLOUDBASE_PUBLISHABLE_KEY": "你的Publishable_Key"
+}
+```
+
+Docker 构建脚本会校验并加载这个文件，再启动 Next.js 构建。文件未提供时继续使用第 4 节的 Docker build args。脚本拒绝未知字段、服务端密钥字段及不完整配置；实际文件已被 Git 忽略。它只应包含公开信息。
+
+**MCP 源码上传自身不会读取 `.gitignore` 或 `.dockerignore`。** 不要把当前开发目录直接设为 `targetPath`。先用 `git archive` 从已审核提交建立独立、干净的目录，再加入上述公开文件；核对目录没有 `.env*`、私钥、`node_modules`、`.next` 或 `artifacts` 后才能上传。所有私钥通过 `serverConfig.EnvParams` 注入运行环境。
+
+本机 stdio MCP 可以读取干净目录；远程 HTTP MCP 无法读取本地文件时，使用控制台 Git 部署或镜像部署。
 
 ### 可选：自行构建镜像，再部署私有镜像
 

@@ -7,6 +7,7 @@ node_modules/
 .cloudbase/
 .tcb/
 .edgeone/
+cloudbase/public-build.json
 *.pem
 *.key
 *.p12

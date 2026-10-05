@@ -27,7 +27,7 @@ ENV NEXT_PUBLIC_DATA_BACKEND=$NEXT_PUBLIC_DATA_BACKEND \
     NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=$NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY \
     NEXT_PUBLIC_TURNSTILE_SITE_KEY=$NEXT_PUBLIC_TURNSTILE_SITE_KEY
 # An empty public directory is valid for this project.
-RUN mkdir -p public && npm run build
+RUN mkdir -p public && node cloudbase/scripts/build-container.mjs
 
 FROM base AS runner
 ENV NODE_ENV=production \
