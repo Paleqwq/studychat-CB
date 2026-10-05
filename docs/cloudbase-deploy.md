@@ -87,6 +87,19 @@ on conflict(user_id) do nothing;
 
 网站实际权限由这个 UUID 白名单控制，匿名学生即使存在映射也不能进入后台。
 
+### 添加第二个或后续网站管理员
+
+无需安装 CLI。先在目标 CloudBase 环境的 **身份认证 → 用户管理** 创建普通用户名密码账号，保持正常状态，复制该账号的真实用户 ID（UID／`sub`）。在 PostgreSQL SQL 编辑器中执行上面的 `insert into public.admin_users` 授权语句，再执行以下查询，将两处占位符都替换为同一个真实 UID：
+
+```sql
+select u.id, u.cloudbase_subject, a.created_at
+from public.app_users u
+join public.admin_users a on a.user_id = u.id
+where u.cloudbase_subject = '真实的CloudBase管理员用户ID';
+```
+
+返回一行表示网站白名单授权成功。随后用新账号的用户名和密码登录 `/admin`；英语助教后台共用此管理员权限。这里添加的是网站管理员，不需要创建 CloudBase 平台管理角色。UID 不是用户名、邮箱或学号，也不能把它直接写入需要 UUID 的 `admin_users.user_id`。
+
 本次已创建专用网站管理员 `studychat_admin`，核验其真实密码登录身份后完成白名单授权。登录信息保存在本机当前 Windows 用户专用目录 `C:/Users/Administrator/.config/studychat-CB/admin-account.txt`；不要把该文件上传到仓库、源码包或聊天。首次登录后可在 CloudBase 身份认证用户管理中修改密码。运行配置另有 Windows DPAPI 加密备份，仅可由当前 Windows 账号解密；更换运行加密密钥会影响已有模型密钥的解密。
 
 可以分别执行这些检查：

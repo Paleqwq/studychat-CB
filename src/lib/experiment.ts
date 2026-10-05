@@ -23,6 +23,9 @@ export type AdminExperiment = ExperimentSettings & {
   has_api_keys: Record<ModelFactor, boolean>;
   enabled: boolean;
   created_at: string;
+  /** Separate from the published experiment revision; drafts never run student sessions. */
+  draft_revision?: number;
+  has_content_draft?: boolean;
 };
 export type GroupCounts = Record<GroupCode, number>;
 export type ResearchConversation = Conversation & {

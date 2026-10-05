@@ -6,7 +6,7 @@ import { dataBackend } from "@/lib/backend";
 import { demoConfig, demoRecord, demoCounts, saveDemoConfig, deleteDemoConversation } from "@/lib/demo";
 import { defaultSettings, type ChatMessage, type RuntimeMode, type StudySettings } from "@/lib/types";
 import { effectiveSettings, groups, groupLabel, modelFactors, type AdminExperiment, type ModelConnection, type ModelFactor, type GroupCounts, type ResearchConversation } from "@/lib/experiment";
-import { experimentSchema } from "@/lib/validation";
+import { experimentSchema, contentDraftSchema } from "@/lib/validation";
 import { resolveProviderEndpoint } from "@/lib/provider-endpoint";
 import { Brand, ChatMark, DemoBanner } from "./shared";
 import { Markdown } from "./markdown";
@@ -63,6 +63,7 @@ export function AdminPanel({ mode }: { mode: RuntimeMode }) {
   const [apiKeys, setApiKeys] = useState({ deepseek: "", chatgpt: "" });
   const [promptGroup, setPromptGroup] = useState(0);
   const [dirty, setDirty] = useState(false);
+  const [connectionDirty, setConnectionDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -95,7 +96,7 @@ export function AdminPanel({ mode }: { mode: RuntimeMode }) {
       if (response.status === 401 || response.status === 403) setCanRetryConnection(false);
       next = await responseJson<AdminExperiment>(response);
     }
-    setConfig(next); setApiKeys({ deepseek: "", chatgpt: "" }); setDirty(false); setAuthenticated(true); setCanRetryConnection(false);
+    setConfig(next); setApiKeys({ deepseek: "", chatgpt: "" }); setDirty(false); setConnectionDirty(false); setAuthenticated(true); setCanRetryConnection(false);
   }
   async function restoreSession() {
     const { data, error: sessionError } = await browserClient("admin").auth.getSession();
@@ -204,7 +205,7 @@ export function AdminPanel({ mode }: { mode: RuntimeMode }) {
     setDirty(true); setNotice("");
   }
   function editConnection<K extends keyof ModelConnection>(key: K, value: ModelConnection[K]) {
-    if (config && connection) edit("connections", { ...config.connections, [modelFactor]: { ...connection, [key]: value } });
+    if (config && connection) { edit("connections", { ...config.connections, [modelFactor]: { ...connection, [key]: value } }); setConnectionDirty(true); }
   }
   function changeProtocol(protocol: StudySettings["protocol"]) {
     // Changing wire protocol must not silently switch the assigned model provider.
@@ -226,8 +227,10 @@ export function AdminPanel({ mode }: { mode: RuntimeMode }) {
     if (!config) return;
     setError(""); setNotice(""); setSaving(true);
     try {
-      const { id: _id, revision, has_api_keys: _has, created_at: _created, ...editable } = config;
-      const input = experimentSchema.safeParse({ ...editable, api_keys: apiKeys, expected_revision: revision });
+      const { id: _id, revision, has_api_keys: _has, created_at: _created,
+        draft_revision, has_content_draft: _draft, ...editable } = config;
+      const input = experimentSchema.safeParse({ ...editable, api_keys: apiKeys, expected_revision: revision,
+        ...(draft_revision === undefined ? {} : { expected_draft_revision: draft_revision }) });
       if (!input.success) {
         const path = input.error.issues[0]?.path[0];
         if (path === "connections") {
@@ -250,8 +253,25 @@ export function AdminPanel({ mode }: { mode: RuntimeMode }) {
         }));
         setConfig(next); setNotice("已同时发布四组配置 v" + next.revision + "。已分组旧会话下次请求使用最新地址、协议及密钥；原模型 ID、提示词、分组和生成参数不变。新登记使用完整新配置。");
       }
-      setApiKeys({ deepseek: "", chatgpt: "" }); setDirty(false);
+      setApiKeys({ deepseek: "", chatgpt: "" }); setDirty(false); setConnectionDirty(false);
     } catch (e) { setError(e instanceof Error ? e.message : "保存失败。"); }
+    finally { setSaving(false); }
+  }
+  async function saveContentDraft() {
+    if (!config) return;
+    setError(""); setNotice(""); setSaving(true);
+    try {
+      const { title, assistant_name, welcome_message, disclosure, base_prompt, personality_prompt, question_mode } = config;
+      const input = contentDraftSchema.parse({ content: { title, assistant_name, welcome_message, disclosure,
+        base_prompt, personality_prompt, ...(question_mode ? { question_mode } : {}) },
+        enabled: config.enabled, expected_draft_revision: config.draft_revision ?? 0 });
+      const next = await responseJson<AdminExperiment>(await authFetch("/api/admin/content-draft", "admin", {
+        method: "PUT", body: JSON.stringify(input)
+      }));
+      // Saving teaching content must retain unsaved connection edits on this screen.
+      setConfig({ ...next, connections: config.connections }); setDirty(connectionDirty);
+      setNotice("内容草稿 d" + next.draft_revision + " 已保存。完成模型配置并发布后，对新登记生效。");
+    } catch (error) { setError(error instanceof Error ? error.message : "内容草稿暂时无法保存。"); }
     finally { setSaving(false); }
   }
   async function openRecord(id: string) {
@@ -343,12 +363,14 @@ export function AdminPanel({ mode }: { mode: RuntimeMode }) {
             <h1>{activeNav.label}</h1><p>{section === "overview" ? "设置被试页面内容与对话开放状态。" :
               section === "prompt" ? "定义助手的角色、目标与交流规则。" : section === "questions" ? "配置三道题、目标层级与两轮问答流程。" :
               section === "connection" ? "选择接口协议，配置 API 地址与模型。" : "查看、追溯和导出被试的完整对话。"}</p></div>
-            {section !== "records" ? <div className="publish-group"><span className={dirty ? "unsaved-label" : "saved-label"}>{dirty ? "有未发布修改" : config?.revision ? "当前 v" + config.revision : "尚未发布"}</span>
+            {section !== "records" ? <div className="publish-group"><span className={dirty ? "unsaved-label" : "saved-label"}>{dirty ? "有未发布修改" : config?.revision ? "当前 v" + config.revision : config?.has_content_draft ? "内容草稿 d" + config.draft_revision + " · 未发布" : "尚未发布"}</span>
+              {!config?.id && section !== "connection" && dataBackend() === "cloudbase" && <button className="button secondary" onClick={() => void saveContentDraft()} disabled={saving || !config}><Save size={16}/>保存内容草稿</button>}
               <button className="button primary" onClick={() => void publish()} disabled={saving || !config}>{saving ? <LoaderCircle size={16} className="spin"/> : <Save size={16}/>}保存并发布</button></div> :
               <button className="button secondary" onClick={() => void loadRecords(offset)} disabled={recordsLoading}><RefreshCw size={16} className={recordsLoading ? "spin" : ""}/>刷新记录</button>}
           </div>
           {error && <div className="error-box" role="alert"><CircleAlert size={17}/>{error}</div>}
           {notice && <div className="success-box" role="status"><Check size={17}/>{notice}</div>}
+          {config?.has_content_draft && <p className="small-note">已保存内容草稿 d{config.draft_revision}，模型配置尚未发布。开放状态随首次正式发布生效。</p>}
           {section !== "records" && config && <div className="settings-grid"><div className="settings-primary">
             {section === "overview" && <>
               <section className="settings-card compact"><div className="card-heading"><span className="section-icon"><SlidersHorizontal size={19}/></span><div><h2>模型 × 人格提示词</h2><p>四组均衡随机分配，组别仅管理员可见。</p></div></div><ExperimentMatrix counts={counts}/></section>
@@ -404,7 +426,7 @@ export function AdminPanel({ mode }: { mode: RuntimeMode }) {
                 <div className="info-note" role="status"><PlugZap size={17}/><span>{endpointError || <>最终请求地址：<code className="endpoint-url">{endpointPreview}</code></>}</span></div>
                 <Field label="API 密钥" help={mode === "demo" ? "演示模式不会保存或调用密钥，请勿输入真实密钥。" : config.has_api_keys[modelFactor] ? "已加密保存。留空保留现有密钥；更换域名时必须重新填写。" : "首次发布必填，仅在服务端加密保存，不会返回完整密钥。"}>
                   <div className="secret-input"><input type={showKey ? "text" : "password"} value={apiKeys[modelFactor]} autoComplete="new-password" maxLength={1000}
-                    disabled={mode === "demo"} onChange={e => { setApiKeys({ ...apiKeys, [modelFactor]: e.target.value }); setDirty(true); }} placeholder={config.has_api_keys[modelFactor] ? "已保存 · 输入新密钥可替换" : mode === "demo" ? "演示模式 · 密钥输入已禁用" : "输入提供商或网关的 API 密钥"}/>
+                    disabled={mode === "demo"} onChange={e => { setApiKeys({ ...apiKeys, [modelFactor]: e.target.value }); setDirty(true); setConnectionDirty(true); }} placeholder={config.has_api_keys[modelFactor] ? "已保存 · 输入新密钥可替换" : mode === "demo" ? "演示模式 · 密钥输入已禁用" : "输入提供商或网关的 API 密钥"}/>
                     <button className="icon-button" aria-label={showKey ? "隐藏密钥" : "显示密钥"} onClick={() => setShowKey(!showKey)}>{showKey ? <EyeOff size={16}/> : <Eye size={16}/>}</button></div>
                 </Field>
                 <Field label="模型 ID" help="填写该服务实际支持的完整模型 ID，不自动替换为其他模型。"><input value={connection.model} onChange={e => editConnection("model", e.target.value)} placeholder="由 API 提供商给出的模型 ID" spellCheck={false}/></Field>

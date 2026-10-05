@@ -3,6 +3,7 @@ import "server-only";
 import { db } from "./db";
 import { databaseError, HttpError } from "./http";
 import { defaultExperiment, type AdminExperiment, type ExperimentSettings, type ModelFactor } from "@/lib/experiment";
+import type { ContentDraft } from "./content-draft";
 
 export type PrivateExperiment = {
   id: string; revision: number; settings: ExperimentSettings;
@@ -19,11 +20,12 @@ export async function currentExperiment() {
   if (configError) databaseError(configError.message);
   return { config: data as PrivateExperiment, enabled: state.enabled as boolean };
 }
-export function redactedExperiment(config: PrivateExperiment | null, enabled: boolean): AdminExperiment {
+export function redactedExperiment(config: PrivateExperiment | null, enabled: boolean, draft?: ContentDraft): AdminExperiment {
   return {
-    ...(config?.settings ?? defaultExperiment()),
+    ...(config?.settings ?? { ...defaultExperiment(), ...(draft?.content ?? {}) }),
     id: config?.id ?? "", revision: config?.revision ?? 0,
     has_api_keys: { deepseek: Boolean(config?.encrypted_keys.deepseek), chatgpt: Boolean(config?.encrypted_keys.chatgpt) },
-    enabled, created_at: config?.created_at ?? ""
+    enabled: !config && draft?.content ? draft.enabled : enabled, created_at: config?.created_at ?? "",
+    ...(!config && draft ? { draft_revision: draft.revision, has_content_draft: Boolean(draft.content) } : {})
   };
 }

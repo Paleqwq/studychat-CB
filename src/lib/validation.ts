@@ -50,8 +50,21 @@ export const experimentSchema = settingsSchema.pick({ title: true, assistant_nam
   connections: z.object({ deepseek: connectionSchema, chatgpt: connectionSchema }).strict(),
   api_keys: z.object({ deepseek: z.string().trim().max(1000), chatgpt: z.string().trim().max(1000) }).strict(),
   enabled: z.boolean(),
-  expected_revision: z.number().int().nonnegative()
+  expected_revision: z.number().int().nonnegative(),
+  expected_draft_revision: z.number().int().nonnegative().optional()
 }).strict();
+
+/** Teaching content can be saved before model connections or API keys exist. */
+export const experimentContentSchema = experimentSchema.pick({
+  title: true, assistant_name: true, welcome_message: true, disclosure: true,
+  base_prompt: true, personality_prompt: true, question_mode: true
+}).strict();
+export const contentDraftSchema = z.object({
+  content: experimentContentSchema,
+  enabled: z.boolean(),
+  expected_draft_revision: z.number().int().nonnegative()
+}).strict();
+export type ExperimentContent = z.infer<typeof experimentContentSchema>;
 
 export function isAllowedHostname(hostname: string, allowlist: string): boolean {
   const hosts = allowlist.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
