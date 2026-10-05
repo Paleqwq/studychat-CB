@@ -87,17 +87,23 @@ export async function verifyCloudBaseToken(token: string, config: PublicCloudBas
     let claims: unknown;
     try { claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")); }
     catch { throw invalidToken(); }
-    // The two remote calls verified the credential. Check the verified PG JWT's realm
-    // and principal type before mapping its immutable subject to our application UUID.
-    if (!object(claims) || claims.sub !== subject || claims.iss !== origin + "/auth/v1" ||
+    // The two remote calls verified the credential. Deployed PG tokens use the
+    // gateway origin; the official PG example uses its /auth/v1 issuer variant.
+    // Accept only these exact issuers in this environment before mapping the user.
+    if (!object(claims) || claims.sub !== subject ||
+        (claims.iss !== origin && claims.iss !== origin + "/auth/v1") ||
         claims.aud !== config.envId || claims.project_id !== config.envId ||
         typeof claims.exp !== "number" || !Number.isFinite(claims.exp) || claims.exp <= Date.now() / 1000 ||
-        !["anon", "authenticated"].includes(String(claims.role)) || typeof claims.is_anonymous !== "boolean" ||
-        (claims.role === "anon") !== claims.is_anonymous || claims.is_system_admin === true ||
+        !["anon", "authenticated"].includes(String(claims.role)) ||
+        (claims.is_anonymous !== undefined && typeof claims.is_anonymous !== "boolean") ||
+        (claims.role === "anon" ? claims.is_anonymous !== true : claims.is_anonymous === true) ||
+        claims.is_system_admin === true ||
         claims.client_type === "client_server" ||
         (object(claims.meta) && ["PublishableKey", "ApiKey"].includes(String(claims.meta.platform))) ||
         (object(claims.app_metadata) && claims.app_metadata.provider === "apikey")) throw invalidToken();
-    const isAnonymous = claims.is_anonymous || profile.created_from === "anonymous";
+    // Real password-login PG tokens may omit is_anonymous. An anonymous role must
+    // explicitly carry true; a remotely verified authenticated role defaults false.
+    const isAnonymous = claims.is_anonymous === true || profile.created_from === "anonymous";
     return { subject, isAnonymous, ...(typeof profile.email === "string" && profile.email.length <= 320 ? { email: profile.email } : {}) };
   } catch (error) {
     if (isAuthError(error)) throw error;

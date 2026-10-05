@@ -1,5 +1,6 @@
 -- Identity layer for a NEW CloudBase PostgreSQL environment.
--- Run through CloudBase SQL Editor / ExecutePGSql as cloudbase_admin.
+-- Run through CloudBase SQL Editor or MCP managePgDatabase migration actions.
+-- Omit the MCP role parameter; cloudbase_admin is a platform-reserved role.
 -- Platform-owned auth.* tables, functions and roles are deliberately untouched.
 -- https://docs.cloudbase.net/authentication-v2/auth/auth-pg
 begin;

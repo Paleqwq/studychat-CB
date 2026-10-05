@@ -2,7 +2,9 @@
 
 本指南适用于独立的 `studychat-CB` 项目，目标为中国站 CloudBase PG 环境和容器型云托管。原项目仍可继续运行。本项目保留 Bloom、英语助教、两套独立学生身份和记录；英语助教继续使用共享 DeepSeek 模型配置与两组独立分配。
 
-**代码和 SQL 已完成本地验证，尚未连接你的 CloudBase 环境执行初始化，也未实际构建 Docker 镜像或部署云托管。** 正式使用前必须完成下文的真实环境验收。以下控制台名称以腾讯云实际页面为准；官方资料核对日期：2026-10-05。
+截至 2026-10-05，已连接你的上海 PG 环境 `studychat-d2g0qgliy0655a4ca`（`ap-shanghai`）并完成新库初始化：迁移任务 `task-c9c18fd1` 返回 `Succeed`，迁移历史包含 `20261005183000`，已核实 22 个业务表／视图。身份认证 v2 的 `anonymous` 和 `usernamePassword` 已开启，真实匿名登录、Token 验证、当前用户查询和服务端 PG 读取均返回 200。
+
+云托管镜像构建任务 `build2608129382` 已完成，已分配入口 [studychat-CB 测试站](https://studychat-cb-323544-9-1253606895.sh.run.tcloudbase.com)，容器健康检查已返回 200。当前镜像仍需包含最新认证兼容修复后重新构建；管理员授权与网站后台登录、业务登记、模型和长 SSE 尚待验收，**目前不能据此认定整个网站已经完成上线**。以下控制台名称以腾讯云实际页面为准；官方资料核对日期：2026-10-05。
 
 ## 1. 确认环境是 PostgreSQL 模式
 
@@ -33,19 +35,47 @@
 
 当前代码直接使用 CloudBase 官方 HTTP Auth 接口，分别保存 Bloom、英语助教、管理员的设备 ID 和登录态；服务端通过 `/auth/v1/token/introspect` 和 `/auth/v1/user/me` 验证实际登录身份，然后映射 UUID。Publishable Key 不能当成学生身份。[验证 Token](https://docs.cloudbase.net/http-api/auth/auth-token-introspect)、[获取当前用户](https://docs.cloudbase.net/http-api/auth/user-me)
 
+本环境实测匿名 JWT 的 issuer 是网关根地址，官方 PG 文档示例则包含 `/auth/v1` 后缀。服务端在两次远端验证成功后，仅接受当前环境这两个精确 issuer，同时验证 subject、环境、有效期和用户类型；不允许第三方 issuer、相似域名或其他路径。
+
+真实普通密码账号 JWT 使用 `authenticated` 角色，但可能缺省 `is_anonymous`。仅在两次远端验证通过后，该角色缺省此字段按非匿名处理；`anon` 角色仍必须显式携带 `is_anonymous:true`，`null`、字符串或角色与布尔值不匹配的 Token 均拒绝。系统管理和 API Key 凭据仍不能作为网站用户登录。
+
 CloudBase 模式不要填写旧 Supabase 的 Turnstile site key；当前接入未实现 CloudBase 验证码流程。
 
 ## 3. 新空数据库初始化
 
 **这一节只适用于全新空库。保留旧学生和会话时先阅读第 7 节。**
 
+**本次环境已成功执行 `20261005183000_studychat_initial`，不要再次初始化。** `cloudbase/migrations/20261005183000_studychat_initial.sql` 是已应用迁移的不可变快照；后续修改必须新增迁移，而不是改写该文件或重跑初始化。下述步骤用于其他新空 PG 环境。
+
 进入 PostgreSQL 的 SQL 编辑器，完整执行 [cloudbase/new_project_init.sql](../cloudbase/new_project_init.sql) 一次。该文件是一个原子 `DO` 语句：包含身份映射和现有 001–008 业务能力，不需再执行 `supabase/migrations`。文件没有创建、替换或删除 CloudBase 的 `auth.*` 对象。
 
-初始化使用控制台 SQL 编辑器或具有相应腾讯云权限的 `ExecutePGSql` 通道，该通道以平台管理员角色执行 DDL。不要通过网站的服务端 API Key 或受限的 `cloudbase_postgres` 角色执行建表。[官方 Auth 角色说明](https://docs.cloudbase.net/authentication-v2/auth/auth-pg)
+初始化使用控制台 SQL 编辑器，或通过具有相应腾讯云权限的 CloudBase MCP `managePgDatabase` 迁移操作执行。**MCP 请求省略 `role`；`cloudbase_admin` 是平台保留角色，不能显式传入。** 平台管理原生 SQL 通道的 DDL 权限，不应把网站的 `service_role` API Key 当作建表管理通道。[官方 Auth 角色说明](https://docs.cloudbase.net/authentication-v2/auth/auth-pg)
 
 官方迁移指南说明 `ExecutePGSql` 每次接受一个 SQL 语句，因此本项目已经把完整初始化包装成单条 `DO`。不能按照分号或换行拆开其中的存储函数。如果控制台报告 SQL 长度或执行时限超标，应按完整 SQL 对象和依赖关系调整；目前未确认你的控制台有这些限制。[官方迁移指南](https://docs.cloudbase.net/quick-start/migration/supabase)
 
 初始化整体失败时，`DO` 中的数据定义会回滚；先修复具体报错再执行。成功后不要重复运行初始化，也不要在已有业务库运行它。
+
+使用 MCP 时先读取完整 SQL 文件，调用 `managePgDatabase` 的 `planMigration`，审核计划后再调用 `applyMigration`。以下 `sql` 表示文件的完整内容，不能把文件路径字符串直接传作 SQL，也不能拆分其中的存储函数：
+
+```text
+planMigration:
+  action: "planMigration"
+  migrationName: "studychat_initial"
+  migrationVersion: "20261005183000"
+  sql: <完整的 cloudbase/new_project_init.sql 内容>
+
+applyMigration:
+  action: "applyMigration"
+  migrationName: "studychat_initial"
+  migrationVersion: "20261005183000"
+  sql: <与计划相同的完整 SQL 内容>
+  confirm: true
+  waitForTask: false
+```
+
+上述版本号是本次已应用记录；其他环境自行使用唯一的新版本号，后续升级也必须使用新版本。`applyMigration` **需要 `confirm:true`**，两次调用均省略 `role`。MCP 会写入 `cloudbase/migrations/<版本号>_<名称>.sql` 本地快照；收到异步任务 ID 只表示已提交，不代表成功。[官方 MCP 数据库工具](https://docs.cloudbase.net/ai/mcp/tool-description)
+
+随后调用 `describeMigrationTask`，传入 `action:"describeMigrationTask"` 与返回的 `taskId`，确认任务 `Status:"Succeed"`；再调用 `listMigrations`，传入 `action:"listMigrations",limit:20`，确认目标版本在迁移历史中。本次已用这两个查询核实 `task-c9c18fd1` 与 `20261005183000`，并另外检查业务表／视图及 PG 服务端读取。
 
 然后在 SQL 编辑器执行以下**一条**管理员授权语句，将占位符替换为身份认证控制台显示的真实管理员用户 ID；不是学号、用户名或邮箱：
 
@@ -176,7 +206,7 @@ docker run --rm --name studychat-cb-test --env-file .env.cloudbase -p 127.0.0.1:
 curl -i http://127.0.0.1:3000/api/health
 ```
 
-返回 `200` 和 `{"status":"ok"}` 只说明进程存活，不能证明 Auth、数据库或模型配置成功。健康接口不会输出秘密或连接信息。**这份指南中的 Docker 命令尚未在本次环境实际执行。**
+返回 `200` 和 `{"status":"ok"}` 只说明进程存活，不能证明 Auth、数据库或模型配置成功。健康接口不会输出秘密或连接信息。**这份指南中的本机 Docker 命令尚未执行；本次实际使用 CloudBase 云端源码构建完成镜像构建。**
 
 云托管启用 HTTP/HTTPS 访问后取得测试域名，把它加入安全域名并更新 `APP_ORIGIN`，发布新的运行配置。先手动发布测试版本，完成验收后再决定是否启用自动部署。
 
@@ -184,7 +214,7 @@ curl -i http://127.0.0.1:3000/api/health
 
 打开 `https://测试站域名/admin`，使用第 2 节创建的账号登录：
 
-1. 配置并发布原模型设置。英语助教依赖共享 DeepSeek 连接，Bloom 的研究配置保持原有结构。
+1. 配置并发布原模型设置。当前首次发布须填写 DeepSeek 和 ChatGPT 两套连接与 API Key；英语助教只使用共享 DeepSeek 连接，Bloom 的研究配置保持原有结构。保存配置不调用模型，但后续普通作答会消耗模型额度。
 2. 打开 `/admin/english-assistant`，设置两组、基础提示词、人格提示词和六阶段 BOPPPS 内容，发布英语课程。
 3. 从学生页面登记不同测试学号：Bloom 与英语助教应分别保存身份、分组、会话和消息。
 4. 验证作答、刷新恢复、长历史、重复提交、暂停、继续、同一活动恢复、管理员删除及导出。退出管理员身份不应改变学生会话。
@@ -237,4 +267,4 @@ curl -i http://127.0.0.1:3000/api/health
 | SSE 一段时间后断开 | 10 秒心跳、网关总时限、前置代理缓冲、模型超时和容器重启记录 |
 | 旧学号不能在新浏览器登记 | 不自动认领历史；按第 7 节核验身份和迁移记录 |
 
-原生 Auth、PG HTTP 网关、Docker 构建、云托管入口和 70 人负载尚需在你的真实环境验收。上线成功以这些操作通过为准，不能仅依据本地测试或 `/api/health` 成功判断。
+本次已核实原生匿名 Auth 和普通密码账号 Token 差异、PG 服务端读取、数据库初始化、云端镜像构建和容器健康检查。仍需部署最新认证修复，并完成网站管理员权限、实际业务记录、模型流式回复及 70 人负载验收；不能仅依据本地测试或 `/api/health` 成功判断整站可用。

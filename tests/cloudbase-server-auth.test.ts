@@ -7,7 +7,7 @@ const origin = `https://${config.envId}.api.tcloudbasegateway.com`;
 const subject = "tencent-user-1";
 function token(extra: object = {}) {
   const payload = { sub: subject, role: "authenticated", is_anonymous: false,
-    iss: origin + "/auth/v1", aud: config.envId, project_id: config.envId,
+    iss: origin, aud: config.envId, project_id: config.envId,
     exp: Math.floor(Date.now() / 1000) + 7200, ...extra };
   return Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url") + "." +
     Buffer.from(JSON.stringify(payload)).toString("base64url") + ".test_signature";
@@ -50,6 +50,46 @@ describe("CloudBase server remote token validation", () => {
       .toMatchObject({ isAnonymous: true });
   });
 
+  it("accepts the official PG example's authenticated issuer variant after remote verification", async () => {
+    const fetcher = validRemote();
+    expect(await verifyCloudBaseToken(token({ iss: origin + "/auth/v1" }), config, fetcher))
+      .toEqual({ subject, isAnonymous: false });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts real password tokens with an authenticated role and an omitted anonymous flag after remote verification", async () => {
+    const fetcher = validRemote({}, { created_from: "password" });
+    expect(await verifyCloudBaseToken(token({ is_anonymous: undefined }), config, fetcher))
+      .toEqual({ subject, isAnonymous: false });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps anonymously created users anonymous when an authenticated token omits the flag", async () => {
+    expect(await verifyCloudBaseToken(token({ is_anonymous: undefined }), config,
+      validRemote({}, { created_from: "anonymous" }))).toEqual({ subject, isAnonymous: true });
+  });
+
+  it("rejects anonymous roles with an omitted flag despite a matching remote anonymous profile", async () => {
+    const fetcher = validRemote({ scope: "anonymous" }, { created_from: "anonymous" });
+    expect((await failure(verifyCloudBaseToken(token({ role: "anon", is_anonymous: undefined }), config, fetcher))).status).toBe(401);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([null, "false", "true", 0, 1])("rejects a non-boolean anonymous flag instead of coercing it: %j", async is_anonymous => {
+    expect((await failure(verifyCloudBaseToken(token({ is_anonymous }), config, validRemote()))).status).toBe(401);
+  });
+
+  it.each([
+    "https://foreign.example", "https://foreign.example/auth/v1",
+    "https://another-environment.api.tcloudbasegateway.com",
+    origin + "/", origin + "/auth/v1/", origin + "/auth/v2",
+    origin + ".foreign.example"
+  ])("rejects a foreign or non-exact issuer despite successful remote validation: %s", async iss => {
+    const fetcher = validRemote();
+    expect((await failure(verifyCloudBaseToken(token({ iss }), config, fetcher))).status).toBe(401);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects locally plausible claims when remote introspection returns the documented empty invalid-token object", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({}));
     expect((await failure(verifyCloudBaseToken(token(), config, fetcher))).status).toBe(401);
@@ -70,7 +110,7 @@ describe("CloudBase server remote token validation", () => {
     { meta: { platform: "PublishableKey" } }, { aud: "another-environment" },
     { iss: "https://foreign.example/auth/v1" }, { project_id: "foreign-environment" },
     { sub: "other-user" }, { role: "anon", is_anonymous: false }, { exp: 0 },
-    { is_anonymous: undefined }, { role: "authenticated", is_anonymous: true },
+    { role: "authenticated", is_anonymous: true },
     { client_type: "client_server" }, { app_metadata: { provider: "apikey" } }
   ])("rejects credentials whose verified PG claims are not an active user in this environment: %j", async claims => {
     expect((await failure(verifyCloudBaseToken(token(claims), config, validRemote()))).status).toBe(401);
