@@ -44,9 +44,10 @@ describe("neutral student presentation", () => {
     const knowledge = { role: "assistant" as const, content: "这项睡眠实验的结果可以支持你的判断。" };
     expect(participantMessageContent(knowledge, true)).toBe(knowledge.content);
   });
-  it("renders the initial and help surfaces without experimental labels, including accessibility text", () => {
+  it("keeps initial and help labels neutral while allowing the requested experiment choice", () => {
     const html = renderToStaticMarkup(createElement(ParticipantChat, { mode: "live", requireCode: false, initialSettings: legacy }));
-    expect(html).not.toMatch(/研究|实验|引导|Bloom|被试/);
+    const outsidePicker = html.replace(/<dialog\b[^>]*id="new-conversation-dialog"[^]*?<\/dialog>/, "");
+    expect(outsidePicker.replaceAll("对话实验", "")).not.toMatch(/研究|实验|引导|Bloom|被试/);
     expect(html).toContain("查看使用说明");
     expect(html).toContain("关闭使用说明");
     expect(html).toContain("会话编号");

@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import Script from "next/script";
 import Link from "next/link";
-import { ArrowUp, BookOpen, Check, ChevronRight, CircleHelp, LoaderCircle, LockKeyhole, MessageSquare, PanelLeft, Pause, Play, RefreshCw, SquarePen, X } from "lucide-react";
+import { ArrowUp, BookOpen, Check, ChevronRight, CircleHelp, FlaskConical, LoaderCircle, LockKeyhole, PanelLeft, Pause, Play, RefreshCw, SquarePen, X } from "lucide-react";
 import { authFetch, browserClient, browserAuthFailure, hasLegacySupabaseSession, responseJson } from "@/lib/browser";
 import { dataBackend } from "@/lib/backend";
 import { demoConfig, demoReply, demoSession, saveDemoSession, demoQuestionReply } from "@/lib/demo";
@@ -13,10 +13,12 @@ import { parseSse } from "@/lib/sse";
 import { type PublicSettings, type ChatEvent, type ChatMessage, type RuntimeMode, type SessionPayload } from "@/lib/types";
 import { participantSettings, participantMessageContent } from "@/lib/participant-presentation";
 import { registrationSchema } from "@/lib/validation";
+import { conversationTitle, openedConversationsKey, readOpenedConversations, rememberOpenedConversation, type OpenedConversation } from "@/lib/opened-conversations";
 import { ChatMark, DemoBanner } from "./shared";
 import { Markdown } from "./markdown";
 import { QuestionProgress } from "./question-progress";
 import { EnglishProgress } from "./english-progress";
+import { ConversationHistory } from "./conversation-history";
 
 declare global {
   interface Window {
@@ -53,6 +55,8 @@ export function ParticipantChat({ mode, requireCode, initialSettings, assistantM
   const [saved, setSaved] = useState(false);
   const [pausePending, setPausePending] = useState(false);
   const [legacyIdentity, setLegacyIdentity] = useState(false);
+  const [newConversation, setNewConversation] = useState(false);
+  const [openedConversations, setOpenedConversations] = useState<OpenedConversation[]>([]);
   const textArea = useRef<HTMLTextAreaElement>(null);
   const end = useRef<HTMLDivElement>(null);
   const captchaContainer = useRef<HTMLDivElement>(null);
@@ -62,6 +66,7 @@ export function ParticipantChat({ mode, requireCode, initialSettings, assistantM
   const sessionRef = useRef<SessionPayload | null>(null);
   const inFlight = useRef(false);
   const pauseRequest = useRef<EnglishPauseRequest | null>(null);
+  const newConversationDialog = useRef<HTMLDialogElement>(null);
   const siteKey = mode === "live" && dataBackend() === "supabase" ? process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY : undefined;
   const visibleSettings = session?.settings ?? entrySettings;
   const settings = english ? englishPublicSettings(visibleSettings.disclosure) : participantSettings(visibleSettings);
@@ -141,6 +146,16 @@ export function ParticipantChat({ mode, requireCode, initialSettings, assistantM
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => {
+    setOpenedConversations(rememberOpenedConversation(mode, assistantMode, session ? conversationTitle(assistantMode, session) : undefined));
+  }, [mode, assistantMode, session?.conversation.title, session?.messages.length]);
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === openedConversationsKey(mode) || event.key === null) setOpenedConversations(readOpenedConversations(mode));
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [mode]);
+  useEffect(() => {
     if (!entry || !siteKey || !captchaReady || !captchaContainer.current || !window.turnstile) return;
     const id = window.turnstile.render(captchaContainer.current, {
       sitekey: siteKey, callback: setCaptchaToken,
@@ -164,6 +179,10 @@ export function ParticipantChat({ mode, requireCode, initialSettings, assistantM
     if (mobileNav) mobileDialog.current?.showModal();
     else mobileDialog.current?.close();
   }, [mobileNav]);
+  useEffect(() => {
+    if (newConversation) newConversationDialog.current?.showModal();
+    else newConversationDialog.current?.close();
+  }, [newConversation]);
   useEffect(() => {
     const query = window.matchMedia("(min-width: 768px)");
     const onResize = () => { if (query.matches) setMobileNav(false); };
@@ -350,35 +369,34 @@ export function ParticipantChat({ mode, requireCode, initialSettings, assistantM
     }
   }
 
-  const navigation = [
-    { mode: "general", href: "/", label: "新对话", icon: SquarePen },
-    { mode: "english", href: "/english-assistant", label: "英语助教", icon: BookOpen }
+  const conversationTypes = [
+    { mode: "general", href: "/", label: "对话实验", description: "开始或继续本次对话实验。", icon: FlaskConical },
+    { mode: "english", href: "/english-assistant", label: "英语助教", description: "学习 PEEC 写作，继续英语练习。", icon: BookOpen }
   ] as const;
 
-  function navigationLinks(rail = false) {
-    return <nav className={rail ? "rail-navigation" : "assistant-navigation"} aria-label={rail ? "切换对话页面" : "对话页面"}>
-      {navigation.map(item => <Link key={item.mode} href={item.href}
-        className={(rail ? "icon-button rail-chat" : "assistant-nav") + (assistantMode === item.mode ? " active" : "")}
-        aria-current={assistantMode === item.mode ? "page" : undefined} aria-label={rail ? item.label : undefined}
-        aria-disabled={busy || undefined} title={busy ? "正在回复，请等待完成后切换" : item.label}
-        onClick={event => { if (inFlight.current) event.preventDefault(); }}
-        onNavigate={event => {
-          if (inFlight.current || assistantMode === item.mode) event.preventDefault();
-          if (!inFlight.current && assistantMode === item.mode) focusConversation();
-          else if (!inFlight.current) setMobileNav(false);
-        }}>
-        <item.icon size={rail ? 20 : 17} strokeWidth={1.7}/>{!rail && <span>{item.label}</span>}
-      </Link>)}
-    </nav>;
+  function closeNewConversation() {
+    newConversationDialog.current?.close();
+    setNewConversation(false);
   }
 
+  function newConversationButton(rail = false) {
+    return <button type="button" className={rail ? "icon-button rail-chat" : "new-conversation-button"}
+      aria-label="新对话" aria-haspopup="dialog" aria-controls="new-conversation-dialog" disabled={busy}
+      title={busy ? "正在回复，请等待完成后选择" : "新对话"}
+      onClick={() => { if (!inFlight.current) setNewConversation(true); }}>
+      <SquarePen size={rail ? 20 : 17} strokeWidth={1.7}/>{!rail && <span>新对话</span>}
+    </button>;
+  }
+
+  const sidebarConversations = openedConversations.length ? openedConversations : [{ mode: assistantMode, title: conversationTitle(assistantMode, session) }];
   const sidebarContent = <>
-    {navigationLinks()}
+    {newConversationButton()}
     <div className="sidebar-section-label">当前会话</div>
-    <button className="current-chat" aria-current="page" onClick={focusConversation}>
-      <MessageSquare size={16} strokeWidth={1.7}/>
-      <span>{english ? "英语助教" : messages.length ? session?.conversation.title : "开始对话"}</span>
-    </button>
+    <ConversationHistory items={sidebarConversations} currentMode={assistantMode} busy={busy}
+      isBusy={() => inFlight.current} onSelect={selectedMode => {
+        if (selectedMode === assistantMode) focusConversation();
+        else setMobileNav(false);
+      }}/>
     <div className="sidebar-bottom">
       <p><LockKeyhole size={14}/>对话自动保存</p>
       <span>在同一浏览器中可继续本次对话。</span>
@@ -394,7 +412,7 @@ export function ParticipantChat({ mode, requireCode, initialSettings, assistantM
         <div className="sidebar-rail">
           <button className="icon-button" aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"} aria-expanded={sidebarOpen}
             aria-controls="conversation-sidebar" title={sidebarOpen ? "收起侧栏" : "展开侧栏"} onClick={() => setSidebarOpen(!sidebarOpen)}><PanelLeft size={20}/></button>
-          {navigationLinks(true)}
+          {newConversationButton(true)}
           <button className="icon-button rail-chat active" aria-label="当前对话" title="当前对话" onClick={focusConversation}><ChatMark size={21}/></button>
           <div className="rail-bottom"><span className="participant-avatar" title="学生" aria-label="学生">学</span></div>
         </div>
@@ -491,6 +509,30 @@ export function ParticipantChat({ mode, requireCode, initialSettings, assistantM
         {sidebarContent}
       </section>
     </dialog>
+    <dialog ref={newConversationDialog} id="new-conversation-dialog" className="new-conversation-dialog"
+      aria-labelledby="new-conversation-title" aria-describedby="new-conversation-description" onClose={() => setNewConversation(false)}
+      onClick={e => { if (e.target === e.currentTarget) closeNewConversation(); }}>
+      <section className="new-conversation-picker">
+        <header><h2 id="new-conversation-title">新对话</h2><button type="button" className="icon-button" aria-label="关闭新对话选择" autoFocus onClick={closeNewConversation}><X size={20}/></button></header>
+        <p id="new-conversation-description">选择要进入的对话类型。</p>
+        <nav className="conversation-type-options" aria-label="选择对话类型">
+          {conversationTypes.map(item => <Link key={item.mode} href={item.href}
+            className={"conversation-type-option" + (assistantMode === item.mode ? " active" : "")}
+            aria-current={assistantMode === item.mode ? "page" : undefined} aria-disabled={busy || undefined}
+            onClick={event => { if (inFlight.current) event.preventDefault(); }}
+            onNavigate={event => {
+              if (inFlight.current) { event.preventDefault(); return; }
+              closeNewConversation();
+              if (assistantMode === item.mode) { event.preventDefault(); focusConversation(); }
+              else setMobileNav(false);
+            }}>
+            <span className="conversation-type-icon"><item.icon size={23} strokeWidth={1.7}/></span>
+            <span className="conversation-type-copy"><strong>{item.label}</strong><span>{item.description}</span></span>
+            <ChevronRight size={18}/>
+          </Link>)}
+        </nav>
+      </section>
+    </dialog>
     <dialog ref={helpDialog} className="help-dialog" aria-labelledby="help-title" onClose={() => setHelp(false)}
       onClick={e => { if (e.target === e.currentTarget) setHelp(false); }}>
       <section className="participant-help">
@@ -499,7 +541,7 @@ export function ParticipantChat({ mode, requireCode, initialSettings, assistantM
         {english && <p>英语助教按 BOPPPS 的导入、目标、前测、参与式学习、后测、总结依次开展 PEEC 写作学习。请完成当前活动，系统会根据作答推进；阶段进度只用于查看。</p>}
         {english && <p>这是独立的 PEEC 课程，分别保留课程记录与学习进度。</p>}
         {english && <p>表达“不想学了”或点击“暂停学习”可保留当前题目与进度；点击“继续学习”后从原处继续。</p>}
-        <p>侧栏的“新对话”和“英语助教”分别保留各自记录；回复生成期间，请等待回复完成后切换。</p>
+        <p>点击侧栏的“新对话”可选择对话类型，各自记录分别保留；回复生成期间，请等待回复完成后切换。</p>
         <p>刷新页面可恢复当前会话；清除浏览器数据或更换设备后，请联系管理员核验，不能仅凭学号读取记录。</p>
         <p>{mode === "demo" ? "当前为本地演示，回复为模拟内容，对话只保存在这个浏览器中。" : "对话记录会保存在服务端。有关记录的查看或删除，请联系管理员。"}</p>
         {english && <p><Link className="text-link" href="/admin/english-assistant" aria-disabled={busy || undefined}

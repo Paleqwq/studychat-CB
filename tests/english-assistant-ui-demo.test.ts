@@ -159,19 +159,25 @@ describe("English assistant presentation", () => {
     expect(finished).not.toContain('aria-current="step"');
   });
 
-  it("adds the same ordered page links to the sidebar, mobile drawer and collapsed rail while keeping general labels intact", () => {
+  it("offers one new-conversation entry on every sidebar surface and two choices in its dialog", () => {
     const english = renderToStaticMarkup(createElement(ParticipantChat, {
       mode: "demo", requireCode: false, initialSettings: defaultSettings, assistantMode: "english"
     }));
     expect(english).toContain('class="chat-title">英语助教');
-    expect(english.match(/href="\/english-assistant"/g)).toHaveLength(3);
-    expect(english.match(/href="\/"/g)).toHaveLength(3);
-    expect(english).toMatch(/aria-label="对话页面"[^]*?新对话[^]*?英语助教/);
+    expect(english.match(/aria-label="新对话" aria-haspopup="dialog"/g)).toHaveLength(3);
+    const picker = english.match(/<dialog\b[^>]*id="new-conversation-dialog"[^]*?<\/dialog>/)![0];
+    expect(picker).toContain('aria-labelledby="new-conversation-title"');
+    expect(picker.match(/class="conversation-type-option(?: active)?"/g)).toHaveLength(2);
+    expect(picker).toMatch(/href="\/"[^]*?对话实验[^]*?href="\/english-assistant"[^]*?英语助教/);
+    expect(picker).toMatch(/<a(?=[^>]*href="\/english-assistant")(?=[^>]*aria-current="page")[^>]*>/);
+    expect(picker).not.toContain(" open=");
+    expect(english).not.toContain("assistant-navigation");
     expect(english).toContain("当前会话");
     const general = renderToStaticMarkup(createElement(ParticipantChat, {
       mode: "demo", requireCode: false, initialSettings: defaultSettings
     }));
     expect(general).toContain('class="chat-title">学习对话');
     expect(general).toContain("学习助手");
+    expect(general).toMatch(/<a(?=[^>]*href="\/")(?=[^>]*aria-current="page")[^>]*>/);
   });
 });

@@ -74,15 +74,15 @@ dialog::backdrop { background: rgb(0 0 0 / .3); }
 .sidebar-panel { min-width: 0; flex: 1; display: flex; flex-direction: column; padding: 0 10px; }
 .sidebar-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-shrink: 0; height: 52px; padding: 0 10px; font-size: 14px; font-weight: 600; }
 .sidebar-section-label { padding: 20px 10px 9px; color: var(--secondary); font-size: 12px; }
-.current-chat { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 40px; padding: 10px; border-radius: 8px; background: var(--active); text-align: left; font-size: 13px; }
-.current-chat:hover { background: #dadada; }
+.conversation-history { display: grid; gap: 4px; }
+.current-chat { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 40px; padding: 10px; border-radius: 8px; background: transparent; text-align: left; font-size: 13px; color: var(--secondary); }
+.current-chat.active { background: var(--active); color: var(--ink); }
+.current-chat:hover { background: var(--hover); color: var(--ink); }
+.current-chat.active:hover { background: #dadada; }
+.current-chat[aria-disabled="true"] { opacity: .45; cursor: wait; }
 .current-chat > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.assistant-navigation { display: flex; flex-direction: column; gap: 4px; padding: 8px 0 0; }
-.assistant-nav { display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 10px; border-radius: 8px; font-size: 13px; color: var(--secondary); }
-.assistant-nav:hover { background: var(--hover); color: var(--ink); }
-.assistant-nav.active { background: var(--active); color: var(--ink); font-weight: 500; }
-.assistant-nav[aria-disabled="true"], .rail-navigation a[aria-disabled="true"] { opacity: .45; cursor: wait; }
-.rail-navigation { display: flex; flex-direction: column; gap: 12px; }
+.new-conversation-button { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 42px; padding: 10px 12px; margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; text-align: left; font-size: 13px; font-weight: 500; }
+.new-conversation-button:hover:not(:disabled) { background: var(--hover); }
 .sidebar-bottom { margin-top: auto; padding: 20px 10px 16px; color: var(--muted); font-size: 12px; line-height: 1.7; }
 .sidebar-bottom > p { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; color: var(--secondary); }
 .sidebar-bottom > span { font-size: 11px; }
@@ -154,6 +154,21 @@ dialog::backdrop { background: rgb(0 0 0 / .3); }
 .entry-card h1 { font-size: 26px; font-weight: 500; margin: 16px 0 10px; }
 .entry-card form { margin-top: 28px; text-align: left; }
 .captcha-container { margin: 16px 0; filter: grayscale(1); }
+.new-conversation-dialog { width: min(480px, calc(100% - 32px)); max-height: calc(100dvh - 48px); padding: 0; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 16px 48px rgb(0 0 0 / .12); }
+.new-conversation-picker { padding: 20px; }
+.new-conversation-picker header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+.new-conversation-picker h2 { font-size: 20px; }
+.new-conversation-picker > p { color: var(--secondary); line-height: 1.7; }
+.conversation-type-options { display: grid; gap: 12px; margin-top: 20px; }
+.conversation-type-option { display: flex; align-items: center; gap: 14px; min-height: 82px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+.conversation-type-option:hover { background: var(--surface); border-color: var(--line-strong); }
+.conversation-type-option.active { border-color: var(--line-strong); }
+.conversation-type-option[aria-disabled="true"] { opacity: .45; cursor: wait; }
+.conversation-type-icon { display: grid; place-items: center; flex-shrink: 0; width: 42px; height: 42px; border-radius: 10px; background: var(--surface); }
+.conversation-type-copy { display: grid; gap: 5px; flex: 1; min-width: 0; }
+.conversation-type-copy strong { font-size: 15px; font-weight: 600; }
+.conversation-type-copy > span { color: var(--secondary); font-size: 12px; line-height: 1.6; }
+.conversation-type-option > svg { color: var(--secondary); }
 .help-dialog { padding: 0; border: 1px solid var(--line); border-radius: 16px; width: min(480px, calc(100% - 32px)); max-height: calc(100dvh - 48px); box-shadow: 0 16px 48px rgb(0 0 0 / .12); }
 .participant-help { padding: 20px 24px 24px; }
 .participant-help header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
