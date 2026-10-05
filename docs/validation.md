@@ -18,6 +18,12 @@
 - 身份认证 v2 配置中 `anonymous`、`usernamePassword` 均为 `true`。
 - 真实网关匿名登录、`/auth/v1/token/introspect`、`/auth/v1/user/me` 均返回 200；`service_role` PG 读取返回 200。测试不输出 Token 或 API Key。
 - 真实匿名 JWT 的 issuer 为 `https://studychat-d2g0qgliy0655a4ca.api.tcloudbasegateway.com`；官方 PG 文档示例使用该地址加 `/auth/v1`。真实普通密码账号 Token 的角色是 `authenticated`，但缺省 `is_anonymous`。代码仅在远端验证成功后接受这两种精确可信 issuer，允许该角色缺省匿名标记为 false；`anon` 必须显式 true，错误类型和非匹配布尔值仍拒绝。最新 56 项认证测试及 `npm run typecheck` 通过。
-- 云托管构建任务 `build2608129382` 完成；[测试入口](https://studychat-cb-323544-9-1253606895.sh.run.tcloudbase.com) 的 `/api/health` 已返回 200。该响应仅证明容器存活。
+- 云托管修复版本 `studychat-cb-002`，构建 `2608124668`、代码提交 `a0941a6` 已发布，管理任务 `2289954` 为 `finished`，服务 `normal`、流量 100%。[测试入口](https://studychat-cb-323544-9-1253606895.sh.run.tcloudbase.com) 的四个页面及 `/api/health` 均返回 200。
+- 网站管理员 `studychat_admin` 已通过真实密码登录、两次远端身份验证并映射业务 UUID；白名单写入成功。共享设置、英语设置和英语会话记录三个后台接口均返回 200，响应未包含密钥或密文。
+- 两个独立学生匿名身份均可读取对应应用会话入口，返回 200 和 `registration_required:true`；两个身份访问管理员设置均返回 403。三项未认证业务接口返回 401；公开 Key 和服务端 Key 均不能冒充网站用户（401）。
+- 浏览器 Auth CORS 预检返回 204，来源准确匹配站点并允许 `X-Device-Id` 等必要请求头；不可信来源的登记 POST 返回 403。运行 `APP_ORIGIN` 已匹配当前入口，安全域名为 `ENABLE`。
+- 当前共享模型配置未发布，英语课程未启用：同源登记 POST 按 `NOT_CONFIGURED` 返回预期 503「对话尚未开放，请联系管理员。」；没有创建学习会话或调用 LLM。测试最初误期望课程暂停的 403；按源码确认配置检查更早执行后，单独复核未发布状态的预期 503 通过。
+- 四个页面、健康接口及 16 个线上静态资源均未包含本次实际服务端 API Key 或运行加密密钥；这是一项公开输出抽样检查，不代表所有潜在路径都已审计。Git 与两次干净源码包都未包含运行密钥、实际环境文件、依赖或本地构建目录；MCP 自动生成的 `cloudbaserc.json` 仅含环境及服务名称。
+- Chrome 中管理员登录页面和修复版英语助教学号入口正常可见，没有登录过期或连接失败提示；没有通过浏览器填写或提交凭据。公开截图保存在忽略的本地 `artifacts` 目录。
 
-本地未安装 Docker 引擎，未执行本机 Docker 构建；已完成的是 CloudBase 云端源码镜像构建。当前云端镜像尚需重新构建以纳入最新认证修复。网站管理员授权和后台登录、学生登记与恢复、模型回复、长 SSE 及 70 人并发尚未完成验收，不将这些环节标记为已通过。按 [部署指南](cloudbase-deploy.md) 继续验证。
+本地未安装 Docker 引擎，未执行本机 Docker 构建；已完成 CloudBase 云端源码镜像构建和修复版发布。当前为新空业务环境，没有导入原站历史记录或模型密钥。学习会话登记与恢复、暂停与删除的线上完整流程、模型回复、长 SSE 及 70 人并发尚未完成验收，不将这些环节标记为已通过。按 [部署指南](cloudbase-deploy.md) 在后台发布共享模型及课程后继续验证。当前资源为 0.5 CPU、1 GiB、最少 0／最多 2 个实例，属于本次测试部署设置，不是已验证的 70 人容量结论。
